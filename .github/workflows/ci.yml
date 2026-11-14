@@ -1,0 +1,97 @@
+name: Backend CI
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: reconcilex_test
+          POSTGRES_USER: reconcilex
+          POSTGRES_PASSWORD: test-only-password
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U reconcilex -d reconcilex_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      DATABASE_URL: postgresql+psycopg://reconcilex:test-only-password@localhost:5432/reconcilex_test
+      JWT_SECRET: test-only-secret-with-32-or-more-characters-123456789
+      DEMO_PASSWORD: demo-test-password
+      STORAGE_MODE: local
+      LOCAL_STORAGE_DIR: /tmp/reconcilex-originals
+      RISK_THRESHOLD_MINOR: 50000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: pip install ruff==0.11.5
+      - run: ruff check app tests scripts --select E4,E7,E9,F821,F822,F823
+      - run: python -m compileall -q app migrations tests
+      - run: alembic upgrade head
+      - run: python -m app.seed
+      - run: python -m app.demo_import --rows 120
+      - run: python -m app.demo_import --rows 120
+      - run: python -m pytest -q
+      - run: python -c "from app.api import app; assert '/api/v1/imports/commit' in app.openapi()['paths']"
+      - name: HTTP application startup
+        run: |
+          python -m uvicorn app.api:app --host 127.0.0.1 --port 8000 &
+          app_pid=$!
+          trap 'kill "$app_pid" 2>/dev/null || true' EXIT
+          for i in $(seq 1 15); do
+            if curl -fsS http://127.0.0.1:8000/health/ready; then exit 0; fi
+            sleep 1
+          done
+          exit 1
+      - run: docker compose config -q
+        env:
+          DB_PASSWORD: local-ci-database-password
+          S3_ACCESS_KEY: reconcilex-local
+          S3_SECRET_KEY: local-ci-object-secret-password
+          JWT_SECRET: test-only-secret-with-32-or-more-characters-123456789
+
+      - name: Build runtime image
+        run: docker compose build api worker
+        env:
+          DB_PASSWORD: local-ci-database-password
+          S3_ACCESS_KEY: reconcilex-local
+          S3_SECRET_KEY: local-ci-object-secret-password
+          JWT_SECRET: test-only-secret-with-32-or-more-characters-123456789
+
+      - name: Smoke test the complete Compose stack
+        run: |
+          docker compose up -d --wait --wait-timeout 180
+          curl --retry 20 --retry-all-errors --retry-delay 2 --max-time 5 --fail --silent --show-error http://127.0.0.1:8000/health/ready
+          docker compose run --rm api python -m app.seed
+          docker compose run --rm api python -m app.demo_import --rows 120
+          docker compose run --rm api python -m app.demo_import --rows 120
+        env:
+          DB_PASSWORD: local-ci-database-password
+          S3_ACCESS_KEY: reconcilex-local
+          S3_SECRET_KEY: local-ci-object-secret-password
+          JWT_SECRET: test-only-secret-with-32-or-more-characters-123456789
+          DEMO_PASSWORD: demo-test-password
+      - name: Collect Compose diagnostics
+        if: failure()
+        run: docker compose logs --no-color --tail=150
+        env:
+          DB_PASSWORD: local-ci-database-password
+          S3_ACCESS_KEY: reconcilex-local
+          S3_SECRET_KEY: local-ci-object-secret-password
+          JWT_SECRET: test-only-secret-with-32-or-more-characters-123456789
+      - name: Tear down smoke stack
+        if: always()
+        run: docker compose down -v
+        env:
+          DB_PASSWORD: local-ci-database-password
+          S3_ACCESS_KEY: reconcilex-local
+          S3_SECRET_KEY: local-ci-object-secret-password
+          JWT_SECRET: test-only-secret-with-32-or-more-characters-123456789
