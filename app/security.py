@@ -2,6 +2,7 @@ import ipaddress
 import os
 from datetime import datetime, timedelta, timezone
 import jwt
+from reconcilex_config import secret_value
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, VerificationError
 from fastapi import Depends, HTTPException
@@ -28,7 +29,7 @@ def verify_password(value, hashed):
 
 
 def token_for(user):
-    secret = os.getenv("JWT_SECRET")
+    secret = secret_value("JWT_SECRET")
     if not secret or len(secret) < 32:
         raise RuntimeError("JWT_SECRET must be set and contain at least 32 characters")
     payload = {
@@ -86,7 +87,7 @@ def current_user(
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise HTTPException(401, "Authentication required")
     try:
-        payload = jwt.decode(credentials.credentials, os.environ["JWT_SECRET"], algorithms=["HS256"])
+        payload = jwt.decode(credentials.credentials, secret_value("JWT_SECRET", required=True), algorithms=["HS256"])
         from uuid import UUID
         user = db.get(User, UUID(payload["sub"]))
     except (jwt.PyJWTError, KeyError, ValueError, TypeError):
