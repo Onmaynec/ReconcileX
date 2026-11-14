@@ -59,13 +59,13 @@ jobs:
           done
           exit 1
       - run: docker compose config -q
-      - name: Validate optional TLS deployment override
-        run: docker compose -f compose.yaml -f compose.tls.yaml config -q
         env:
           DB_PASSWORD: local-ci-database-password
           S3_ACCESS_KEY: reconcilex-local
           S3_SECRET_KEY: local-ci-object-secret-password
           JWT_SECRET: test-only-secret-with-32-or-more-characters-123456789
+      - name: Validate optional TLS deployment override
+        run: docker compose -f compose.yaml -f compose.tls.yaml config -q
         env:
           DB_PASSWORD: local-ci-database-password
           S3_ACCESS_KEY: reconcilex-local
