@@ -11,23 +11,27 @@ services:
       interval: 5s
       retries: 20
     networks: [backend]
-  minio:
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+  silo:
+    image: docker.io/pgsty/silo:RELEASE.2026-11-12T00-00-00Z
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${S3_ACCESS_KEY:?set-S3_ACCESS_KEY}
       MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?set-S3_SECRET_KEY}
-    volumes: [minio_data:/data]
+    volumes: [silo_data:/data]
+    healthcheck:
+      test: ["CMD", "silo", "healthcheck", "ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     networks: [backend]
   init-storage:
-    image: minio/mc:latest
-    entrypoint: /bin/sh
-    command: -c 'until mc alias set local http://minio:9000 "$$S3_ACCESS_KEY" "$$S3_SECRET_KEY"; do sleep 2; done; mc mb --ignore-existing local/reconcilex'
+    image: docker.io/pgsty/mc:RELEASE.2026-11-12T00-00-00Z
+    command: ["mb", "--ignore-existing", "local/reconcilex"]
     environment:
-      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set-S3_ACCESS_KEY}
-      S3_SECRET_KEY: ${S3_SECRET_KEY:?set-S3_SECRET_KEY}
+      MC_HOST_local: http://${S3_ACCESS_KEY:?set-S3_ACCESS_KEY}:${S3_SECRET_KEY:?set-S3_SECRET_KEY}@silo:9000
     depends_on:
-      minio: {condition: service_started}
+      silo: {condition: service_healthy}
+    restart: on-failure:5
     networks: [backend]
   migrate:
     build: .
@@ -35,7 +39,7 @@ services:
     environment: &app_env
       DATABASE_URL: postgresql+psycopg://reconcilex:${DB_PASSWORD:?set-DB_PASSWORD-in-.env}@postgres:5432/reconcilex
       JWT_SECRET: ${JWT_SECRET:?set-JWT_SECRET}
-      S3_ENDPOINT: http://minio:9000
+      S3_ENDPOINT: http://silo:9000
       S3_BUCKET: reconcilex
       S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set-S3_ACCESS_KEY}
       S3_SECRET_KEY: ${S3_SECRET_KEY:?set-S3_SECRET_KEY}
@@ -64,6 +68,6 @@ services:
     networks: [backend]
 volumes:
   postgres_data:
-  minio_data:
+  silo_data:
 networks:
   backend:
