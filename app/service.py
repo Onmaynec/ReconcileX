@@ -326,7 +326,13 @@ def _indexed_candidates(index, record, window, forbidden,
         dates, entries = group
         lo = bisect_left(dates, record.booked_date - timedelta(days=window))
         hi = bisect_right(dates, record.booked_date + timedelta(days=window))
-        return [item for item in entries[lo:hi] if item.id not in forbidden][:maximum]
+        result = []
+        for item in entries[lo:hi]:
+            if item.id not in forbidden:
+                result.append(item)
+                if len(result) >= maximum:
+                    break
+        return result
 
     key = (record.account, record.currency, record.reference)
     group = index.get(key)
