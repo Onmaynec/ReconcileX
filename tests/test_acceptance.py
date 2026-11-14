@@ -415,3 +415,34 @@ def test_worker_crash_rolls_back_and_retry_succeeds(setup, monkeypatch):
             MatchMember.record_id.in_([uuid.UUID(r["id"]) for r in
                                        records(ids, tokens, "external")]),
             MatchMember.active.is_(True))) == 1
+
+
+def test_same_priority_rules_with_different_candidates_are_ambiguous(setup):
+    ids, tokens = setup
+    new_rule = client.post("/api/v1/rules", headers=headers(tokens, "admin"), json={
+        "source_id": str(ids["source"]), "rule_key": "same-priority-broad",
+        "priority": 100, "day_window": 2,
+        "tolerance_minor": 0, "require_reference": False,
+    })
+    assert new_rule.status_code == 201, new_rule.text
+    assert import_rows(ids, tokens, "external", fixture_lines(
+        ("SPECIFIC", "2026-09-15", "20.00"))).status_code == 200
+    assert import_rows(ids, tokens, "internal", fixture_lines(
+        ("SPECIFIC", "2026-09-15", "20.00"),
+        ("DIFFERENT", "2026-09-15", "20.00"))).status_code == 200
+    submitted = client.post("/api/v1/reconciliation/run",
+                            headers=headers(tokens, key="same-priority-rules-0001"),
+                            params={"period_id": str(ids["period"])})
+    assert submitted.status_code == 202, submitted.text
+    assert run_once()
+    issues_result = client.get("/api/v1/issues", headers=headers(tokens),
+                               params={"source_id": str(ids["source"]),
+                                       "period_id": str(ids["period"])})
+    assert issues_result.status_code == 200, issues_result.text
+    assert any(issue["issue_type"] == "ambiguous" and len(issue["candidates"]) == 2
+               for issue in issues_result.json())
+    with SessionLocal() as db:
+        assert not db.scalar(select(MatchMember.id).where(
+            MatchMember.record_id.in_([
+                uuid.UUID(row["id"]) for row in records(ids, tokens, "external")
+            ]), MatchMember.active.is_(True)))
