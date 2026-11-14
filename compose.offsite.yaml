@@ -1,0 +1,16 @@
+# Opt-in. Configure HTTPS storage and independent credentials.
+# Protect destination bucket with versioning and Object Lock retention.
+services:
+  backup:
+    environment:
+      OFFSITE_ENABLED: "1"
+      OFFSITE_S3_ENDPOINT: ${OFFSITE_S3_ENDPOINT:?set-offsite-HTTPS-endpoint}
+      OFFSITE_S3_BUCKET: ${OFFSITE_S3_BUCKET:?set-offsite-bucket}
+      OFFSITE_S3_ACCESS_KEY: ${OFFSITE_S3_ACCESS_KEY:?set-independent-offsite-access-key}
+      OFFSITE_S3_SECRET_KEY: ${OFFSITE_S3_SECRET_KEY:?set-independent-offsite-secret}
+      OFFSITE_MANIFEST_HMAC_KEY: ${OFFSITE_MANIFEST_HMAC_KEY:?set-independent-manifest-signing-key}
+      OFFSITE_S3_REGION: ${OFFSITE_S3_REGION:-us-east-1}
+      OFFSITE_S3_PREFIX: ${OFFSITE_S3_PREFIX:-reconcilex}
+      OFFSITE_S3_ENCRYPTION: ${OFFSITE_S3_ENCRYPTION:-AES256}
+      OFFSITE_S3_KMS_KEY_ID: ${OFFSITE_S3_KMS_KEY_ID:-}
+      OFFSITE_MAX_AGE_HOURS: ${OFFSITE_MAX_AGE_HOURS:-36}
