@@ -1,4 +1,4 @@
-# Безопасность ReconcileX v0.8.0
+# Безопасность ReconcileX v0.9.0
 
 ## HTTPS-подключение
 
@@ -96,3 +96,39 @@ TRUSTED_PROXY_CIDRS=172.29.240.10/32
 ### Что не закрыто
 
 Issue #4 остаётся открытым. Не реализованы MFA/SSO и подключение конкретного внешнего secret manager; полная RBAC-матрица каждого действия, конкурентные тесты на целевой нагрузке и независимый security review требуют отдельной приёмки. TLS smoke не заменяет проверку реального сертификата, DNS, firewall, обновления и хранения private key.
+
+
+## File-backed secrets (v0.9.0)
+
+Для развёртывания без передачи секретов в Compose environment используйте отдельный файл:
+
+~~~sh
+docker compose -f compose.yaml -f compose.secrets.yaml up --build -d
+~~~
+
+До запуска создайте на хосте отдельные файлы с секретами и укажите в .env только пути:
+
+~~~dotenv
+DB_PASSWORD_FILE=./secrets/db_password
+JWT_SECRET_FILE=./secrets/jwt_secret
+S3_ACCESS_KEY_FILE=./secrets/s3_access_key
+S3_SECRET_KEY_FILE=./secrets/s3_secret_key
+~~~
+
+Внутри контейнеров файлы монтируются в /run/secrets. PostgreSQL читает пароль через POSTGRES_PASSWORD_FILE, SILO — через MINIO_ROOT_USER_FILE и MINIO_ROOT_PASSWORD_FILE; API и worker используют общий загрузчик NAME_FILE. Для off-site архива можно добавить compose.offsite.secrets.yaml и задать пути OFFSITE_S3_ACCESS_KEY_FILE, OFFSITE_S3_SECRET_KEY_FILE, OFFSITE_MANIFEST_HMAC_KEY_FILE.
+
+Загрузчик отклоняет одновременное задание непустой переменной и соответствующего _FILE, нечитаемые/слишком большие файлы, некорректный UTF-8 и NUL. Секреты не включаются в диагностические сообщения. Пароль БД при сборке DATABASE_URL кодируется как URI-компонент, поэтому @, :, / и другие специальные символы не меняют структуру подключения.
+
+### Границы защиты
+
+Compose file-backed secrets для локального Docker Compose — это read-only mount из файлов хоста, а не внешний secret manager и не шифрование файлов на диске. Ограничьте права к каталогу (например, доступ только deployment user), не добавляйте его в Git и не помещайте содержимое секретов в логи или CI artifacts. Для production используйте штатный секретный менеджер платформы или безопасную инъекцию файлов, организуйте ротацию и отдельное резервирование ключей. При смене DB password обновите и файл PostgreSQL, и файл приложения, затем пересоздайте сервисы в согласованном окне.
+
+Off-site credentials и HMAC-ключ должны быть отдельными от основных S3 credentials. Для них используйте дополнительный secrets override. Не применяйте CI тестовые значения в реальной среде.
+
+### RBAC приёмка v0.9.0
+
+tests/test_security_v090.py проверяет доступ пяти ролей к отчётам, строкам, исключениям, экспорту, профилям, правилам, истории и метрикам. Отдельно проверяются admin-only изменения, операторские и контролёрские операции, права submitter на job и аудит отказов при скачивании оригиналов. Тесты используют синтетические записи и не заменяют независимый security review.
+
+### Что остаётся открытым
+
+Issue #4 остаётся открытым: нет MFA/SSO, внешнего Vault/KMS integration, полного review всех бизнес-операций независимой стороной, реальных production-сертификатов/домена и security acceptance на целевом стенде. File-backed secrets закрывает передачу секретов через Compose environment для соответствующего профиля, но не решает хранение/ротацию на хосте.
