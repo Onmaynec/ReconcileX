@@ -2,7 +2,9 @@
 import argparse
 import csv
 import json
-from datetime import date
+import os
+import zipfile
+from datetime import date, datetime
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -70,12 +72,30 @@ def create_csv(path, spec, number):
 
 
 def create_xlsx(path, spec, number):
+    """Canonical ZIP members and workbook timestamps make XLSX hashes reproducible."""
     book = Workbook(write_only=True)
+    fixed = datetime(2026, 1, 1, 0, 0, 0)
+    book.properties.created = fixed
+    book.properties.modified = fixed
     sheet = book.create_sheet("Transactions")
     sheet.append(list(spec["mapping"].values()))
     for row in rows_for(spec, number):
         sheet.append(row)
-    book.save(path)
+    temporary = Path(str(path) + ".uncanonical")
+    book.save(temporary)
+    try:
+        with zipfile.ZipFile(temporary, "r") as source_zip:
+            members = [(info, source_zip.read(info.filename))
+                       for info in source_zip.infolist()]
+        with zipfile.ZipFile(path, "w") as output_zip:
+            for original, payload in members:
+                info = zipfile.ZipInfo(original.filename, date_time=(2026, 1, 1, 0, 0, 0))
+                info.compress_type = original.compress_type
+                info.external_attr = original.external_attr
+                info.create_system = original.create_system
+                output_zip.writestr(info, payload)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def main():
