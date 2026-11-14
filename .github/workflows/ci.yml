@@ -69,7 +69,7 @@ jobs:
       - name: Smoke test the complete Compose stack
         run: |
           docker compose up -d --wait --wait-timeout 180
-          curl --retry 10 --retry-delay 2 --retry-connrefused -fsS http://127.0.0.1:8000/health/ready
+          curl --retry 20 --retry-all-errors --retry-delay 2 --max-time 5 --fail --silent --show-error http://127.0.0.1:8000/health/ready
           docker compose run --rm api python -m app.seed
           docker compose run --rm api python -m app.demo_import --rows 120
           docker compose run --rm api python -m app.demo_import --rows 120
