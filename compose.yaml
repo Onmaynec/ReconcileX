@@ -1,0 +1,69 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: reconcilex
+      POSTGRES_USER: reconcilex
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set-DB_PASSWORD-in-.env}
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reconcilex -d reconcilex"]
+      interval: 5s
+      retries: 20
+    networks: [backend]
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?set-S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?set-S3_SECRET_KEY}
+    volumes: [minio_data:/data]
+    networks: [backend]
+  init-storage:
+    image: minio/mc:latest
+    entrypoint: /bin/sh
+    command: -c 'until mc alias set local http://minio:9000 "$$S3_ACCESS_KEY" "$$S3_SECRET_KEY"; do sleep 2; done; mc mb --ignore-existing local/reconcilex'
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set-S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?set-S3_SECRET_KEY}
+    depends_on:
+      minio: {condition: service_started}
+    networks: [backend]
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment: &app_env
+      DATABASE_URL: postgresql+psycopg://reconcilex:${DB_PASSWORD:?set-DB_PASSWORD-in-.env}@postgres:5432/reconcilex
+      JWT_SECRET: ${JWT_SECRET:?set-JWT_SECRET}
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: reconcilex
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set-S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?set-S3_SECRET_KEY}
+      DEMO_PASSWORD: ${DEMO_PASSWORD:-}
+      RISK_THRESHOLD_MINOR: ${RISK_THRESHOLD_MINOR:-10000000}
+    depends_on:
+      postgres: {condition: service_healthy}
+    networks: [backend]
+  api:
+    build: .
+    environment: *app_env
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      init-storage: {condition: service_completed_successfully}
+    restart: unless-stopped
+    networks: [backend]
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    environment: *app_env
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      init-storage: {condition: service_completed_successfully}
+    restart: unless-stopped
+    networks: [backend]
+volumes:
+  postgres_data:
+  minio_data:
+networks:
+  backend:
