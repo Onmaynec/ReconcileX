@@ -152,6 +152,7 @@ jobs:
       - name: TLS proxy smoke and per-client login throttling
         run: |
           mkdir -p certs
+          trap 'rm -rf certs' EXIT
           openssl req -x509 -nodes -newkey rsa:2048 -days 1 \
             -keyout certs/privkey.pem -out certs/fullchain.pem \
             -subj "/CN=localhost"
@@ -181,7 +182,7 @@ jobs:
           TRUSTED_HOSTS: localhost,127.0.0.1
       - name: Collect Compose diagnostics
         if: failure()
-        run: docker compose logs --no-color --tail=150
+        run: docker compose -f compose.yaml -f compose.tls.yaml logs --no-color --tail=150
         env:
           DB_PASSWORD: local-ci-database-password
           S3_ACCESS_KEY: reconcilex-local
@@ -189,7 +190,7 @@ jobs:
           JWT_SECRET: test-only-secret-with-32-or-more-characters-123456789
       - name: Tear down smoke stack
         if: always()
-        run: docker compose down -v
+        run: docker compose -f compose.yaml -f compose.tls.yaml down -v
         env:
           DB_PASSWORD: local-ci-database-password
           S3_ACCESS_KEY: reconcilex-local
