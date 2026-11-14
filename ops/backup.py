@@ -18,6 +18,8 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 import boto3
 from botocore.config import Config
@@ -337,6 +339,36 @@ def status(max_age_hours):
     print(json.dumps(result), flush=True)
 
 
+def send_alert(event):
+    """Optional HTTPS webhook with event-only metadata, no financial content."""
+    if not offsite.configured():
+        return
+    endpoint = os.getenv("OFFSITE_ALERT_WEBHOOK_URL", "")
+    if not endpoint:
+        return
+    parts = urlparse(endpoint)
+    if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
+        print(json.dumps({"event": "alert_delivery_failed",
+                          "reason": "invalid_https_endpoint"}), file=sys.stderr, flush=True)
+        return
+    payload = json.dumps({
+        "service": "reconcilex", "event": event,
+        "timestamp": utcnow().isoformat(),
+    }).encode("utf-8")
+    try:
+        request = Request(
+            endpoint, data=payload, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urlopen(request, timeout=8) as response:
+            if not 200 <= response.status < 300:
+                raise RuntimeError("Non-success alert response")
+    except Exception:
+        # Do not print endpoint, error body, secrets or customer data.
+        print(json.dumps({"event": "alert_delivery_failed",
+                          "reason": "transport_error"}), file=sys.stderr, flush=True)
+
+
 def schedule():
     keep = int(os.getenv("BACKUP_KEEP", "7"))
     hour = int(os.getenv("BACKUP_HOUR_UTC", "3"))
@@ -348,6 +380,7 @@ def schedule():
         except Exception as exc:
             print(json.dumps({"event": "backup_failed", "message": str(exc)}),
                   file=sys.stderr, flush=True)
+            send_alert("backup_failed")
             # Keep service alive to retry, do not mark a partial snapshot successful.
         now = utcnow()
         next_run = now.replace(hour=hour, minute=0, second=0, microsecond=0)
@@ -390,6 +423,8 @@ def main():
     except Exception as exc:
         print(json.dumps({"event": "backup_error", "message": str(exc)}),
               file=sys.stderr, flush=True)
+        if args.command == "status":
+            send_alert("backup_stale")
         sys.exit(1)
 
 
