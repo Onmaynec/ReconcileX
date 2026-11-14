@@ -22,6 +22,16 @@ on:
         required: true
         type: number
         default: 1
+      tolerance_minor:
+        description: Allowed difference in integer minor units for one reference-aware rule
+        required: true
+        type: number
+        default: 0
+      drift_minor:
+        description: Synthetic difference per matched pair, not exceeding tolerance
+        required: true
+        type: number
+        default: 0
 permissions:
   contents: read
 jobs:
@@ -62,12 +72,16 @@ jobs:
           EXTRA_INTERNAL: ${{ inputs.internal_extra }}
           EXTRA_EXTERNAL: ${{ inputs.external_extra }}
           RUNS: ${{ inputs.runs }}
+          TOLERANCE_MINOR: ${{ inputs.tolerance_minor }}
+          DRIFT_MINOR: ${{ inputs.drift_minor }}
         run: |
           python -m scripts.e2e_benchmark \
             --pairs "$PAIRS" \
             --internal-extra "$EXTRA_INTERNAL" \
             --external-extra "$EXTRA_EXTERNAL" \
             --runs "$RUNS" \
+            --tolerance-minor "$TOLERANCE_MINOR" \
+            --drift-minor "$DRIFT_MINOR" \
             --output /tmp/reconcilex-full-e2e.json
       - uses: actions/upload-artifact@v4
         if: always()
