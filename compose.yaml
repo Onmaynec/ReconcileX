@@ -45,6 +45,7 @@ services:
       S3_SECRET_KEY: ${S3_SECRET_KEY:?set-S3_SECRET_KEY}
       DEMO_PASSWORD: ${DEMO_PASSWORD:-}
       RISK_THRESHOLD_MINOR: ${RISK_THRESHOLD_MINOR:-10000000}
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-}
     depends_on:
       postgres: {condition: service_healthy}
     networks: [backend]
@@ -54,6 +55,36 @@ services:
     ports: ["127.0.0.1:8000:8000"]
     depends_on:
       migrate: {condition: service_completed_successfully}
+      init-storage: {condition: service_completed_successfully}
+    restart: unless-stopped
+    networks: [backend]
+  backup:
+    build:
+      context: .
+      dockerfile: Dockerfile.backup
+    command: ["schedule"]
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: reconcilex
+      PGUSER: reconcilex
+      PGPASSWORD: ${DB_PASSWORD:?set-DB_PASSWORD-in-.env}
+      S3_ENDPOINT: http://silo:9000
+      S3_BUCKET: reconcilex
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set-S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?set-S3_SECRET_KEY}
+      BACKUP_ROOT: /var/backups/reconcilex
+      BACKUP_KEEP: ${BACKUP_KEEP:-7}
+      BACKUP_HOUR_UTC: ${BACKUP_HOUR_UTC:-3}
+    volumes: [backup_data:/var/backups/reconcilex]
+    healthcheck:
+      test: ["CMD", "python3", "/opt/reconcilex/backup.py", "status", "--max-age-hours", "36"]
+      start_period: 10m
+      interval: 1h
+      timeout: 30s
+      retries: 3
+    depends_on:
+      postgres: {condition: service_healthy}
       init-storage: {condition: service_completed_successfully}
     restart: unless-stopped
     networks: [backend]
@@ -69,5 +100,6 @@ services:
 volumes:
   postgres_data:
   silo_data:
+  backup_data:
 networks:
   backend:

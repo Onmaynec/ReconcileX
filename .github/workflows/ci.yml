@@ -40,6 +40,13 @@ jobs:
       - run: python -m app.demo_import --rows 120
       - run: python -m app.demo_import --rows 120
       - run: python -m pytest -q
+      - name: Synthetic preview and database throughput protocol
+        run: python -m scripts.benchmark --external 1000 --internal 1250 --preview 20000 --trials 3 --db-load --output /tmp/reconcilex-perf.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reconcilex-perf-synthetic
+          path: /tmp/reconcilex-perf.json
+          retention-days: 14
       - run: python -c "from app.api import app; assert '/api/v1/imports/commit' in app.openapi()['paths']"
       - name: HTTP application startup
         run: |
@@ -57,9 +64,16 @@ jobs:
           S3_ACCESS_KEY: reconcilex-local
           S3_SECRET_KEY: local-ci-object-secret-password
           JWT_SECRET: test-only-secret-with-32-or-more-characters-123456789
+      - name: Validate optional TLS deployment override
+        run: docker compose -f compose.yaml -f compose.tls.yaml config -q
+        env:
+          DB_PASSWORD: local-ci-database-password
+          S3_ACCESS_KEY: reconcilex-local
+          S3_SECRET_KEY: local-ci-object-secret-password
+          JWT_SECRET: test-only-secret-with-32-or-more-characters-123456789
 
       - name: Build runtime image
-        run: docker compose build api worker
+        run: docker compose build api worker backup
         env:
           DB_PASSWORD: local-ci-database-password
           S3_ACCESS_KEY: reconcilex-local
@@ -73,6 +87,10 @@ jobs:
           docker compose run --rm api python -m app.seed
           docker compose run --rm api python -m app.demo_import --rows 120
           docker compose run --rm api python -m app.demo_import --rows 120
+          docker compose run --rm backup once
+          docker compose run --rm backup verify
+          docker compose run --rm backup restore-check
+          docker compose run --rm backup status --max-age-hours 36
         env:
           DB_PASSWORD: local-ci-database-password
           S3_ACCESS_KEY: reconcilex-local

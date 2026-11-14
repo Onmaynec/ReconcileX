@@ -1,0 +1,8 @@
+FROM postgres:16-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-boto3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY ops/backup.py /opt/reconcilex/backup.py
+RUN mkdir -p /var/backups/reconcilex && chown postgres:postgres /var/backups/reconcilex
+USER postgres
+ENTRYPOINT ["python3", "/opt/reconcilex/backup.py"]
+CMD ["schedule"]
