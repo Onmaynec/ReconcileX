@@ -291,3 +291,127 @@ def test_at06_parallel_confirmation_rejects_second_claim(setup):
     with ThreadPoolExecutor(max_workers=2) as executor:
         states = list(executor.map(approve, groups))
     assert sorted(states) == [200, 409]
+
+
+def test_generated_six_formats_and_invalid_fixtures(tmp_path):
+    import json
+    import subprocess
+    import sys
+    from types import SimpleNamespace
+    from app.importer import inspect_file
+
+    subprocess.run([sys.executable, "scripts/generate_demo.py", "--rows", "120",
+                    "--out", str(tmp_path)], check=True)
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["rows"] == 120
+    assert len(manifest["files"]) == 6
+    for spec in manifest["files"]:
+        source = SimpleNamespace(currency=spec["currency"], account="FIXTURE-ACCOUNT")
+        profile = SimpleNamespace(
+            encoding=spec["encoding"], delimiter=spec["delimiter"],
+            mapping=spec["mapping"], date_format=spec["date_format"],
+            decimal_separator=spec["decimal_separator"])
+        result = inspect_file(
+            (tmp_path / spec["file"]).read_bytes(), spec["file"],
+            profile, source, spec["kind"],
+            date(2026, spec["month"], 1), date(2026, spec["month"], 28))
+        assert result["valid_rows"] == 20, spec["file"]
+        assert not result["errors"], (spec["file"], result["errors"])
+    rub = manifest["files"][0]
+    source = SimpleNamespace(currency="RUB", account="FIXTURE-ACCOUNT")
+    profile = SimpleNamespace(
+        encoding="utf-8", delimiter=",",
+        mapping={"reference": "reference", "date": "date", "amount": "amount"},
+        date_format="%Y-%m-%d", decimal_separator=".")
+    invalid = inspect_file(
+        (tmp_path / "invalid_rows.csv").read_bytes(), "invalid_rows.csv",
+        profile, source, "external", date(2026, 8, 1), date(2026, 8, 31))
+    assert len(invalid["errors"]) == 12
+    duplicate = inspect_file(
+        (tmp_path / "duplicate_rows.csv").read_bytes(), "duplicate_rows.csv",
+        profile, source, "external", date(2026, 8, 1), date(2026, 8, 31))
+    assert len(duplicate["errors"]) == 1
+
+
+def test_rate_limit_returns_429_for_repeated_invalid_logins():
+    username = "unknown-" + uuid.uuid4().hex
+    for _ in range(5):
+        result = client.post("/api/v1/auth/token",
+                             json={"username": username, "password": "bad"})
+        assert result.status_code == 401, result.text
+    response = client.post("/api/v1/auth/token",
+                           json={"username": username, "password": "bad"})
+    assert response.status_code == 429
+    assert response.json()["code"] == "429"
+
+
+def test_closed_snapshots_survive_reopen_and_reclose(setup):
+    ids, tokens = setup
+    assert import_rows(ids, tokens, "external", fixture_lines(
+        ("FIRST", "2026-09-10", "10.00"))).status_code == 200
+    first = client.post(f"/api/v1/periods/{ids['period']}/close",
+                        headers=headers(tokens, "controller"))
+    assert first.status_code == 200, first.text
+    original_hash = first.json()["snapshot_sha256"]
+    reopened = client.post(f"/api/v1/periods/{ids['period']}/reopen",
+                           json={"reason": "Исправление финансового реестра месяца"},
+                           headers=headers(tokens, "controller"))
+    assert reopened.status_code == 200, reopened.text
+    assert import_rows(ids, tokens, "external", fixture_lines(
+        ("SECOND", "2026-09-11", "20.00"))).status_code == 200
+    second = client.post(f"/api/v1/periods/{ids['period']}/close",
+                         headers=headers(tokens, "controller"))
+    assert second.status_code == 200, second.text
+    assert second.json()["snapshot_sha256"] != original_hash
+    history = client.get(f"/api/v1/periods/{ids['period']}/snapshots",
+                         headers=headers(tokens, "auditor"))
+    assert history.status_code == 200, history.text
+    versions = history.json()
+    assert len(versions) == 2
+    assert versions[0]["snapshot_sha256"] == original_hash
+    assert versions[0]["report"]["by_source"][0]["external_minor"] == 1000
+    assert versions[1]["report"]["by_source"][0]["external_minor"] == 3000
+
+
+def test_worker_crash_rolls_back_and_retry_succeeds(setup, monkeypatch):
+    import app.worker as worker
+    from app.models import ReconcileJob
+
+    ids, tokens = setup
+    assert import_rows(ids, tokens, "external", fixture_lines(
+        ("CRASH", "2026-09-20", "9.00"))).status_code == 200
+    assert import_rows(ids, tokens, "internal", fixture_lines(
+        ("CRASH", "2026-09-21", "9.00"))).status_code == 200
+    job_resp = client.post("/api/v1/reconciliation/run",
+                           headers=headers(tokens, key="crash-injection-job-0001"),
+                           params={"period_id": str(ids["period"])})
+    assert job_resp.status_code == 202, job_resp.text
+    job_id = job_resp.json()["id"]
+    original = worker.reconcile
+
+    def crash_after_flushing(db, job):
+        original(db, job)
+        db.flush()
+        raise RuntimeError("injected failure after transactional match")
+
+    monkeypatch.setattr(worker, "reconcile", crash_after_flushing)
+    assert worker.run_once()
+    with SessionLocal() as db:
+        job = db.get(ReconcileJob, uuid.UUID(job_id))
+        assert job.state == "failed"
+        assert not db.scalar(select(MatchMember.id).where(
+            MatchMember.record_id.in_([uuid.UUID(r["id"]) for r in
+                                       records(ids, tokens, "external")]),
+            MatchMember.active.is_(True)))
+    retry = client.post(f"/api/v1/reconciliation/jobs/{job_id}/retry",
+                        headers=headers(tokens))
+    assert retry.status_code == 200, retry.text
+    monkeypatch.setattr(worker, "reconcile", original)
+    assert worker.run_once()
+    with SessionLocal() as db:
+        job = db.get(ReconcileJob, uuid.UUID(job_id))
+        assert job.state == "done"
+        assert db.scalar(select(func.count(MatchMember.id)).where(
+            MatchMember.record_id.in_([uuid.UUID(r["id"]) for r in
+                                       records(ids, tokens, "external")]),
+            MatchMember.active.is_(True))) == 1
