@@ -40,7 +40,8 @@ from app.security import (
 )
 from app.service import (
     approve_group, audit, build_report, cancel_group, close_period,
-    create_manual_group, current_rules, locked_period, reopen_period, submit_job,
+    create_manual_group, current_rules, ensure_period_source_access,
+    locked_period, reopen_period, submit_job,
 )
 from app.storage import get_original, put_original
 
@@ -75,7 +76,7 @@ def transaction(db):
 
 
 app = FastAPI(
-    title="ReconcileX API", version="0.2.0",
+    title="ReconcileX API", version="0.4.0",
     description="Auditable reconciliation for synthetic bank statements and internal ledgers.",
 )
 log = configure_logging()
@@ -188,8 +189,8 @@ def group_info(group):
 
 
 class LoginBody(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=1, max_length=200)
 
 
 @app.post("/api/v1/auth/token")
@@ -224,6 +225,39 @@ def login(body: LoginBody, request: Request, db=Depends(get_db)):
     return {"access_token": token_for(user), "token_type": "bearer", "role": user.role}
 
 
+class PasswordChangeBody(BaseModel):
+    current_password: str = Field(min_length=1, max_length=200)
+    new_password: str = Field(min_length=12, max_length=200)
+
+
+@app.post("/api/v1/auth/change-password")
+def change_own_password(body: PasswordChangeBody,
+                        user=Depends(current_user), db=Depends(get_db)):
+    with transaction(db):
+        account = db.scalar(select(User).where(User.id == user.id).with_for_update())
+        if not account or not account.enabled:
+            raise HTTPException(401, "Account disabled")
+        if not verify_password(body.current_password, account.password_hash):
+            raise HTTPException(403, "Current password is incorrect")
+        if verify_password(body.new_password, account.password_hash):
+            raise HTTPException(400, "New password must differ")
+        account.password_hash = hash_password(body.new_password)
+        account.token_epoch += 1
+        audit(db, account, "user.password_changed", "User", account.id)
+        return {"changed": True, "sessions_revoked": True}
+
+
+@app.post("/api/v1/auth/logout-all")
+def logout_all_sessions(user=Depends(current_user), db=Depends(get_db)):
+    with transaction(db):
+        account = db.scalar(select(User).where(User.id == user.id).with_for_update())
+        if not account or not account.enabled:
+            raise HTTPException(401, "Account disabled")
+        account.token_epoch += 1
+        audit(db, account, "user.sessions_revoked", "User", account.id)
+        return {"sessions_revoked": True}
+
+
 class SourceBody(BaseModel):
     name: str = Field(min_length=2, max_length=160)
     account: str = Field(min_length=1, max_length=64)
@@ -251,6 +285,19 @@ def list_sources(user=Depends(current_user), db=Depends(get_db)):
             for s in db.scalars(stmt)]
 
 
+@app.get("/api/v1/admin/users")
+def admin_list_users(limit: int = 100, offset: int = 0,
+                     user=Depends(current_user), db=Depends(get_db)):
+    require_role(user, "admin")
+    if not 1 <= limit <= 200 or offset < 0:
+        raise HTTPException(400, "Invalid pagination")
+    found = db.scalars(select(User).order_by(User.username, User.id)
+                       .limit(limit).offset(offset)).all()
+    return [{"id": str(account.id), "username": account.username,
+             "role": account.role, "enabled": account.enabled}
+            for account in found]
+
+
 class UserBody(BaseModel):
     username: str = Field(min_length=3, max_length=100)
     password: str = Field(min_length=12, max_length=200)
@@ -275,6 +322,68 @@ def create_user(body: UserBody, user=Depends(current_user), db=Depends(get_db)):
         return {"id": str(new.id)}
 
 
+class ResetPasswordBody(BaseModel):
+    new_password: str = Field(min_length=12, max_length=200)
+
+
+@app.post("/api/v1/admin/users/{user_id}/reset-password")
+def admin_reset_password(user_id: UUID, body: ResetPasswordBody,
+                         user=Depends(current_user), db=Depends(get_db)):
+    require_role(user, "admin")
+    with transaction(db):
+        account = db.scalar(select(User).where(User.id == user_id).with_for_update())
+        if not account:
+            raise HTTPException(404, "User not found")
+        if verify_password(body.new_password, account.password_hash):
+            raise HTTPException(400, "New password must differ")
+        account.password_hash = hash_password(body.new_password)
+        account.token_epoch += 1
+        audit(db, user, "user.password_reset", "User", account.id,
+              {"username": account.username})
+        return {"id": str(account.id), "sessions_revoked": True}
+
+
+@app.post("/api/v1/admin/users/{user_id}/disable")
+def admin_disable_user(user_id: UUID, user=Depends(current_user),
+                       db=Depends(get_db)):
+    require_role(user, "admin")
+    with transaction(db):
+        # Stable lock order protects the last enabled admin from two concurrent
+        # administrative requests disabling each other's accounts.
+        admins = db.scalars(select(User).where(
+            User.role == "admin").order_by(User.id).with_for_update()).all()
+        account = db.scalar(select(User).where(User.id == user_id).with_for_update())
+        if not account:
+            raise HTTPException(404, "User not found")
+        if account.id == user.id:
+            raise HTTPException(409, "Cannot disable your own administrator account")
+        if account.role == "admin" and account.enabled and sum(
+            1 for item in admins if item.enabled) <= 1:
+            raise HTTPException(409, "Cannot disable the last enabled administrator")
+        if account.enabled:
+            account.enabled = False
+            account.token_epoch += 1
+            audit(db, user, "user.disabled", "User", account.id,
+                  {"username": account.username})
+        return {"id": str(account.id), "enabled": account.enabled,
+                "sessions_revoked": True}
+
+
+@app.post("/api/v1/admin/users/{user_id}/enable")
+def admin_enable_user(user_id: UUID, user=Depends(current_user),
+                      db=Depends(get_db)):
+    require_role(user, "admin")
+    with transaction(db):
+        account = db.scalar(select(User).where(User.id == user_id).with_for_update())
+        if not account:
+            raise HTTPException(404, "User not found")
+        if not account.enabled:
+            account.enabled = True
+            audit(db, user, "user.enabled", "User", account.id,
+                  {"username": account.username})
+        return {"id": str(account.id), "enabled": account.enabled}
+
+
 class GrantBody(BaseModel):
     user_id: UUID
     source_id: UUID
@@ -296,6 +405,34 @@ def grant_source(body: GrantBody, user=Depends(current_user), db=Depends(get_db)
         audit(db, user, "source.granted", "SourceGrant", grant.id,
               {"user_id": str(body.user_id)}, body.source_id)
         return {"id": str(grant.id), "created": True}
+
+
+@app.post("/api/v1/admin/grants/revoke")
+def revoke_source_access(body: GrantBody, user=Depends(current_user),
+                         db=Depends(get_db)):
+    require_role(user, "admin")
+    with transaction(db):
+        grant = db.scalar(select(SourceGrant).where(
+            SourceGrant.user_id == body.user_id,
+            SourceGrant.source_id == body.source_id,
+        ).with_for_update())
+        if not grant:
+            return {"revoked": False}
+        db.delete(grant)
+        audit(db, user, "source.revoked", "SourceGrant", grant.id,
+              {"user_id": str(body.user_id)}, body.source_id)
+        return {"revoked": True}
+
+
+@app.get("/api/v1/admin/grants")
+def admin_list_grants(user_id: UUID, user=Depends(current_user),
+                      db=Depends(get_db)):
+    require_role(user, "admin")
+    if not db.get(User, user_id):
+        raise HTTPException(404, "User not found")
+    return [{"id": str(grant.id), "source_id": str(grant.source_id)}
+            for grant in db.scalars(select(SourceGrant).where(
+                SourceGrant.user_id == user_id).order_by(SourceGrant.source_id))]
 
 
 class ProfileBody(BaseModel):
@@ -355,6 +492,8 @@ def create_period(body: PeriodBody, user=Depends(current_user), db=Depends(get_d
     if body.end_date < body.start_date:
         raise HTTPException(400, "Invalid date range")
     with transaction(db):
+        if db.bind.dialect.name == "postgresql":
+            db.execute(text("SELECT pg_advisory_xact_lock(4100400404)"))
         if db.scalar(select(Period.id).where(
             Period.start_date <= body.end_date, Period.end_date >= body.start_date)):
             raise HTTPException(409, "Period overlaps an existing period")
@@ -741,11 +880,7 @@ def get_match(group_id: UUID, user=Depends(current_user), db=Depends(get_db)):
 @app.post("/api/v1/periods/{period_id}/close")
 def close(period_id: UUID, user=Depends(current_user), db=Depends(get_db)):
     with transaction(db):
-        # A controller cannot close a period containing sources outside their grants.
-        sources = db.scalars(select(ImportBatch.source_id).where(
-            ImportBatch.period_id == period_id).distinct()).all()
-        for source_id in sources:
-            ensure_source(db, user, source_id)
+        ensure_period_source_access(db, user, period_id)
         period = close_period(db, period_id, user)
         return {"id": str(period.id), "status": period.status,
                 "snapshot_sha256": period.snapshot_sha256}
@@ -758,6 +893,7 @@ class ReasonBody(BaseModel):
 @app.post("/api/v1/periods/{period_id}/reopen")
 def reopen(period_id: UUID, body: ReasonBody, user=Depends(current_user), db=Depends(get_db)):
     with transaction(db):
+        ensure_period_source_access(db, user, period_id)
         period = reopen_period(db, period_id, user, body.reason)
         return {"id": str(period.id), "status": period.status, "version": period.version}
 

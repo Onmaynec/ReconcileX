@@ -31,6 +31,26 @@ def audit(db, actor, action, entity, entity_id, details=None, source_id=None):
     ))
 
 
+def ensure_period_source_access(db, actor, period_id):
+    """A controller must be authorized for EVERY source touched by a period.
+
+    Closed periods can include source records and rejected imports, not only
+    committed batches. Job rule snapshots may reference a source even when
+    no financial rows were imported. Avoid checking only the visible report.
+    """
+    require_role(actor, "controller")
+    sources = set()
+    for model in (Record, ImportBatch, MatchGroup, ReconcileIssue):
+        sources.update(db.scalars(select(model.source_id).where(
+            model.period_id == period_id).distinct()))
+    for frozen in db.scalars(select(ReconcileJob.rules_snapshot).where(
+        ReconcileJob.period_id == period_id)):
+        for rule in frozen:
+            sources.add(UUID(rule["source_id"]))
+    for source_id in sorted(sources):
+        ensure_source(db, actor, source_id)
+
+
 def locked_period(db, period_id):
     period = db.scalar(select(Period).where(Period.id == period_id).with_for_update())
     if not period:
