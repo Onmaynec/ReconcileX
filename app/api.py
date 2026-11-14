@@ -5,6 +5,8 @@ import io
 from contextlib import contextmanager
 import logging
 import os
+import time
+import re
 import uuid
 from datetime import date
 from datetime import datetime, timezone
@@ -26,6 +28,7 @@ from app.models import (
     SourceGrant, User,
 )
 from app.request_context import request_id
+from app.observability import configure_logging, metrics
 from app.security import (
     current_user, ensure_source, hash_password, require_role,
     token_for, verify_password, ROLES,
@@ -50,20 +53,26 @@ app = FastAPI(
     title="ReconcileX API", version="0.1.0",
     description="Auditable reconciliation for synthetic bank statements and internal ledgers.",
 )
-log = logging.getLogger("reconcilex")
+log = configure_logging()
 
 
 @app.middleware("http")
 async def request_context_middleware(request: Request, call_next):
     value = request.headers.get("X-Request-ID")
-    identifier = value if value and len(value) <= 64 and value.isascii() else str(uuid.uuid4())
+    identifier = value if value and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) else str(uuid.uuid4())
     token = request_id.set(identifier)
+    started = time.perf_counter()
     try:
         response = await call_next(request)
         response.headers["X-Request-ID"] = identifier
+        elapsed = round((time.perf_counter() - started) * 1000, 3)
+        route = request.scope.get("route")
+        label = request.method + " " + (route.path if route else request.url.path)
+        metrics.record(label, response.status_code, elapsed)
         log.info("request", extra={
             "request_id": identifier, "method": request.method,
-            "path": request.url.path, "status_code": response.status_code,
+            "path": label, "status_code": response.status_code,
+            "duration_ms": elapsed,
         })
         return response
     finally:
@@ -749,3 +758,12 @@ def live():
 def ready(db=Depends(get_db)):
     db.execute(text("SELECT 1"))
     return {"status": "ready"}
+
+
+@app.get("/api/v1/admin/metrics")
+def request_metrics(user=Depends(current_user)):
+    require_role(user, "admin")
+    return {
+        "scope": "single API process", "percentile_window": 10000,
+        "routes": metrics.snapshot(),
+    }
