@@ -324,3 +324,57 @@ def test_concurrent_period_creation_cannot_overlap(scope):
             json=body, headers=auth(scope, "admin")) for body in requests]
         statuses = [future.result().status_code for future in futures]
     assert sorted(statuses) == [201, 409], statuses
+
+
+def test_self_service_logout_revokes_all_current_tokens(scope):
+    active = auth(scope, "auditor")
+    assert client.get("/api/v1/sources", headers=active).status_code == 200
+    response = client.post("/api/v1/auth/logout-all", headers=active)
+    assert response.status_code == 200, response.text
+    assert response.json()["sessions_revoked"] is True
+    assert client.get("/api/v1/sources", headers=active).status_code == 401
+    login = client.post("/api/v1/auth/token", json={
+        "username": "v4-auditor-" + scope["suffix"],
+        "password": scope["password"],
+    })
+    assert login.status_code == 200, login.text
+    with SessionLocal() as db:
+        assert db.get(User, scope["users"]["auditor"]).token_epoch == 1
+
+
+def test_admin_list_users_hides_password_hash_and_is_role_restricted(scope):
+    forbidden = client.get("/api/v1/admin/users", headers=auth(scope, "operator"))
+    assert forbidden.status_code == 403
+    allowed = client.get("/api/v1/admin/users",
+                         headers=auth(scope, "admin"), params={"limit": 200})
+    assert allowed.status_code == 200
+    data = allowed.json()
+    target = next(value for value in data
+                  if value["id"] == str(scope["users"]["operator"]))
+    assert set(target) == {"id", "username", "role", "enabled"}
+    assert "password" not in str(data).lower()
+    assert client.get("/api/v1/admin/users",
+                      headers=auth(scope, "admin"),
+                      params={"limit": 201}).status_code == 400
+
+
+def test_admin_grant_list_tracks_revoke_without_exposing_other_users(scope):
+    uid = scope["users"]["operator"]
+    params = {"user_id": str(uid)}
+    assert client.get("/api/v1/admin/grants", params=params,
+                      headers=auth(scope, "analyst")).status_code == 403
+    before = client.get("/api/v1/admin/grants", params=params,
+                        headers=auth(scope, "admin"))
+    assert before.status_code == 200
+    assert {value["source_id"] for value in before.json()} >= {
+        str(scope["a"]), str(scope["b"])}
+    response = client.post("/api/v1/admin/grants/revoke",
+                           headers=auth(scope, "admin"),
+                           json={"user_id": str(uid),
+                                 "source_id": str(scope["b"])})
+    assert response.status_code == 200 and response.json()["revoked"] is True
+    after = client.get("/api/v1/admin/grants", params=params,
+                       headers=auth(scope, "admin"))
+    assert after.status_code == 200
+    assert str(scope["b"]) not in {value["source_id"] for value in after.json()}
+    assert str(scope["a"]) in {value["source_id"] for value in after.json()}
