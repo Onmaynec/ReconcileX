@@ -1,11 +1,13 @@
 """Versioned HTTP API. All financial state changes execute in database transactions."""
 import csv
+import hashlib
 import io
 from contextlib import contextmanager
 import logging
 import os
 import uuid
 from datetime import date
+from datetime import datetime, timezone
 from typing import Literal
 from uuid import UUID
 
@@ -19,7 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from app.db import SessionLocal, get_db
 from app.importer import MAX_BYTES, inspect_file
 from app.models import (
-    AuditEvent, ImportBatch, ImportProfile, MatchGroup, MatchMember,
+    AuditEvent, AuthAttempt, ImportBatch, ImportProfile, MatchGroup, MatchMember, PeriodSnapshot,
     MatchRule, Period, Record, ReconcileIssue, ReconcileJob, Source,
     SourceGrant, User,
 )
@@ -148,10 +150,33 @@ class LoginBody(BaseModel):
 
 
 @app.post("/api/v1/auth/token")
-def login(body: LoginBody, db=Depends(get_db)):
+def login(body: LoginBody, request: Request, db=Depends(get_db)):
+    """DB-backed 5 failures/60s limit for username + originating connection."""
+    key = hashlib.sha256(
+        ((request.client.host if request.client else "unknown") + "|" + body.username.lower())
+        .encode("utf-8")).hexdigest()
+    # PostgreSQL advisory lock makes first-attempt insert safe under concurrency.
+    if db.bind.dialect.name == "postgresql":
+        lock_key = int.from_bytes(bytes.fromhex(key)[:8], "big", signed=True)
+        db.execute(text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": lock_key})
+    attempt = db.scalar(select(AuthAttempt).where(AuthAttempt.key == key).with_for_update())
+    now = datetime.now(timezone.utc)
+    if attempt and (now - attempt.window_start).total_seconds() < 60 and attempt.attempts >= 5:
+        raise HTTPException(429, "Too many login attempts. Retry after 60 seconds")
     user = db.scalar(select(User).where(User.username == body.username))
     if not user or not user.enabled or not verify_password(body.password, user.password_hash):
+        if attempt is None:
+            db.add(AuthAttempt(key=key, attempts=1, window_start=now))
+        elif (now - attempt.window_start).total_seconds() >= 60:
+            attempt.attempts = 1
+            attempt.window_start = now
+        else:
+            attempt.attempts += 1
+        db.commit()
         raise HTTPException(401, "Invalid credentials")
+    if attempt:
+        db.delete(attempt)
+    db.commit()
     return {"access_token": token_for(user), "token_type": "bearer", "role": user.role}
 
 
@@ -401,12 +426,12 @@ async def import_commit(
             "errors": result["errors"],
         })
     with transaction(db):
-        locked_period(db, period_id)
         previous = db.scalar(select(ImportBatch).where(
             ImportBatch.source_id == source_id, ImportBatch.file_sha256 == result["sha256"]))
         if previous:
             return {"id": str(previous.id), "duplicate": True,
                     "row_count": previous.row_count, "total_minor": previous.total_minor}
+        locked_period(db, period_id)
         keys = [r["natural_key"] for r in result["records"]]
         for offset in range(0, len(keys), 500):
             existing = db.scalar(select(Record.id).where(
@@ -456,8 +481,13 @@ def download_original(batch_id: UUID, user=Depends(current_user), db=Depends(get
                   {"reason": "source_access_denied"}, batch.source_id)
         raise
     if user.role not in {"operator", "controller", "admin", "auditor"}:
+        with SessionLocal.begin() as session:
+            audit(session, user, "security.file_denied", "ImportBatch", batch.id,
+                  {"reason": "role_forbidden"}, batch.source_id)
         raise HTTPException(403, "Role cannot download originals")
     data = get_original(batch.object_key)
+    if hashlib.sha256(data).hexdigest() != batch.file_sha256:
+        raise HTTPException(500, "Original file integrity check failed")
     return Response(data, media_type="application/octet-stream",
                     headers={"Content-Disposition": "attachment; filename=original.bin",
                              "Cache-Control": "no-store"})
@@ -499,6 +529,27 @@ def job_status(job_id: UUID, user=Depends(current_user), db=Depends(get_db)):
     if job.created_by != user.id and user.role != "admin":
         raise HTTPException(403, "Job not accessible")
     return {"id": str(job.id), "state": job.state, "attempts": job.attempts, "error": job.error}
+
+
+@app.post("/api/v1/reconciliation/jobs/{job_id}/retry")
+def retry_job(job_id: UUID, user=Depends(current_user), db=Depends(get_db)):
+    require_role(user, "operator", "controller")
+    with transaction(db):
+        job = db.scalar(select(ReconcileJob).where(ReconcileJob.id == job_id).with_for_update())
+        if not job:
+            raise HTTPException(404, "Job not found")
+        if job.created_by != user.id:
+            raise HTTPException(403, "Only job submitter can retry")
+        for rule in job.rules_snapshot:
+            ensure_source(db, user, UUID(rule["source_id"]))
+        locked_period(db, job.period_id)
+        if job.state != "failed":
+            raise HTTPException(409, "Only failed jobs may be retried")
+        job.state = "queued"
+        job.error = None
+        job.lease_until = None
+        audit(db, user, "job.retried", "ReconcileJob", job.id)
+        return {"id": str(job.id), "state": job.state}
 
 
 @app.get("/api/v1/issues")
@@ -600,6 +651,34 @@ def reopen(period_id: UUID, body: ReasonBody, user=Depends(current_user), db=Dep
     with transaction(db):
         period = reopen_period(db, period_id, user, body.reason)
         return {"id": str(period.id), "status": period.status, "version": period.version}
+
+
+@app.get("/api/v1/periods/{period_id}/snapshots")
+def historical_snapshots(period_id: UUID, user=Depends(current_user), db=Depends(get_db)):
+    require_role(user, "auditor", "controller", "admin")
+    if not db.get(Period, period_id):
+        raise HTTPException(404, "Period not found")
+    histories = db.scalars(select(PeriodSnapshot).where(
+        PeriodSnapshot.period_id == period_id).order_by(PeriodSnapshot.sequence)).all()
+    if user.role == "admin":
+        allowed = None
+    else:
+        allowed = set(db.scalars(select(SourceGrant.source_id).where(
+            SourceGrant.user_id == user.id)).all())
+    output = []
+    for h in histories:
+        report = h.content["report"]
+        rows = report["by_source"]
+        if allowed is not None:
+            rows = [r for r in rows if UUID(r["source_id"]) in allowed]
+        if rows or allowed is None:
+            output.append({
+                "sequence": h.sequence, "snapshot_sha256": h.sha256,
+                "closed_by": str(h.closed_by),
+                "report": {"period_id": report["period_id"],
+                           "period_name": report["period_name"], "by_source": rows},
+            })
+    return output
 
 
 @app.get("/api/v1/reports/period/{period_id}")
