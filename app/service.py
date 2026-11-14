@@ -11,7 +11,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.models import (
     AuditEvent, ImportBatch, MatchGroup, MatchMember, MatchRule, Period, PeriodSnapshot,
-    ReconcileIssue, Record, ReconcileJob, Source, utcnow,
+    ReconcileIssue, Record, ReconcileJob, Source, User, utcnow,
 )
 from app.security import ensure_source, require_role
 
@@ -128,6 +128,9 @@ def _make_group(db, period, source_id, rule, external, internal,
         fail(409, "Records must belong to the same source and open period")
     if len({r.account for r in records}) != 1 or len({r.currency for r in records}) != 1:
         fail(409, "Different accounts or currencies cannot be matched")
+    dates = [r.booked_date for r in records]
+    if (max(dates) - min(dates)).days > rule["window"]:
+        fail(409, "Group dates exceed the selected rule window")
     ext_total = sum(r.amount_minor for r in external)
     int_total = sum(r.amount_minor for r in internal)
     delta = ext_total - int_total
@@ -382,7 +385,10 @@ def reconcile(db, job):
                 stats["unmatched"] += 1
                 continue
             internal, rule = winner
-            group = _make_group(db, period, src_uuid, rule, [ext], [internal])
+            submitter = db.get(User, job.created_by)
+            if not submitter:
+                fail(409, "Reconciliation submitter no longer exists")
+            group = _make_group(db, period, src_uuid, rule, [ext], [internal], actor=submitter)
             if group.state == "approved":
                 active.update((ext.id, internal.id))
                 stats["matched"] += 1
@@ -445,6 +451,13 @@ def build_report(db, period):
 def close_period(db, period_id, actor):
     require_role(actor, "controller")
     period = locked_period(db, period_id)
+    if db.scalar(select(ReconcileJob.id).where(
+        ReconcileJob.period_id == period.id,
+        ReconcileJob.state.in_(("queued", "running"))).limit(1)):
+        fail(409, "Cannot close period with unfinished reconciliation jobs")
+    if db.scalar(select(MatchGroup.id).where(
+        MatchGroup.period_id == period.id, MatchGroup.state == "proposed").limit(1)):
+        fail(409, "Cannot close period with unapproved match groups")
     batches = db.scalars(select(ImportBatch).where(ImportBatch.period_id == period.id)
                         .order_by(ImportBatch.id)).all()
     rules = db.scalars(select(MatchRule).order_by(
