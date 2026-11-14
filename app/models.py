@@ -212,3 +212,24 @@ class AuditEvent(Base):
     details = Column(JSON, nullable=False)
     request_id = Column(String(70), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class PeriodSnapshot(Base):
+    """Historical closure snapshot; old closed states remain reconstructible after reopening."""
+    __tablename__ = "period_snapshots"
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uid)
+    period_id = Column(Uuid(as_uuid=True), ForeignKey("periods.id"), nullable=False)
+    sequence = Column(Integer, nullable=False)
+    content = Column(JSON, nullable=False)
+    sha256 = Column(String(64), nullable=False)
+    closed_by = Column(Uuid(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    __table_args__ = (UniqueConstraint("period_id", "sequence", name="uq_period_snapshot_sequence"),)
+
+
+class AuthAttempt(Base):
+    """Distributed login rate limit state. Key is a hash of client and username."""
+    __tablename__ = "auth_attempts"
+    key = Column(String(64), primary_key=True)
+    attempts = Column(Integer, nullable=False)
+    window_start = Column(DateTime(timezone=True), nullable=False)
