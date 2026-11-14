@@ -31,7 +31,8 @@ def token_for(user):
     if not secret or len(secret) < 32:
         raise RuntimeError("JWT_SECRET must be set and contain at least 32 characters")
     payload = {
-        "sub": str(user.id), "iat": datetime.now(timezone.utc),
+        "sub": str(user.id), "ver": int(user.token_epoch or 0),
+        "iat": datetime.now(timezone.utc),
         "exp": datetime.now(timezone.utc) + timedelta(hours=8),
     }
     return jwt.encode(payload, secret, algorithm="HS256")
@@ -51,6 +52,8 @@ def current_user(
         raise HTTPException(401, "Invalid or expired token")
     if not user or not user.enabled:
         raise HTTPException(401, "Account disabled or not found")
+    if not isinstance(payload.get("ver"), int) or payload["ver"] != user.token_epoch:
+        raise HTTPException(401, "Session revoked")
     return user
 
 

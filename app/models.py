@@ -25,6 +25,7 @@ class User(Base):
     password_hash = Column(String(255), nullable=False)
     role = Column(String(20), nullable=False)
     enabled = Column(Boolean, nullable=False, default=True)
+    token_epoch = Column(Integer, nullable=False, default=0, server_default=text("0"))
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 

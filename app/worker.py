@@ -8,7 +8,7 @@ from uuid import UUID
 from sqlalchemy import or_, select
 
 from app.db import SessionLocal
-from app.models import ReconcileJob, SourceGrant, utcnow
+from app.models import ReconcileJob, SourceGrant, User, utcnow
 from app.service import reconcile
 
 log = logging.getLogger("reconcilex.worker")
@@ -36,10 +36,17 @@ def run_once():
                 ReconcileJob.id == job_id).with_for_update())
             if not job or job.state != "running":
                 return True
-            for rule in job.rules_snapshot:
-                grant = db.scalar(select(SourceGrant.id).where(
+            # Lock the submitter and grants until the reconciliation transaction
+            # commits. A concurrent disable/revoke waits instead of allowing
+            # a financial commit after access has been revoked.
+            owner = db.scalar(select(User).where(
+                User.id == job.created_by).with_for_update())
+            if not owner or not owner.enabled or owner.role not in {"operator", "controller"}:
+                raise PermissionError("Submitting account disabled or no longer authorized")
+            for source_id in sorted({UUID(rule["source_id"]) for rule in job.rules_snapshot}):
+                grant = db.scalar(select(SourceGrant).where(
                     SourceGrant.user_id == job.created_by,
-                    SourceGrant.source_id == UUID(rule["source_id"])))
+                    SourceGrant.source_id == source_id).with_for_update())
                 if not grant:
                     raise PermissionError("Source access revoked before job execution")
             result = reconcile(db, job)
