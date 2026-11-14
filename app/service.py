@@ -277,17 +277,230 @@ def cancel_group(db, group_id, actor, reason, expected_version):
     return group
 
 
+
+def _batch_insert(db, model, values, size=500):
+    """Bound SQL statement size while preserving one all-or-nothing transaction."""
+    from sqlalchemy import insert
+    for offset in range(0, len(values), size):
+        db.execute(insert(model), values[offset:offset + size])
+
+
+def _exact_candidates(index, record, window, forbidden, maximum=11):
+    """Find up to maximum unclaimed, same-reference 1:1 candidates."""
+    from bisect import bisect_left, bisect_right
+
+    key = (record.account, record.currency, record.reference, record.amount_minor)
+    group = index.get(key)
+    if not group:
+        return []
+    dates, entries = group
+    lo = bisect_left(dates, record.booked_date - timedelta(days=window))
+    hi = bisect_right(dates, record.booked_date + timedelta(days=window))
+    result = []
+    for item in entries[lo:hi]:
+        if item.id not in forbidden:
+            result.append(item)
+            if len(result) == maximum:
+                break
+    return result
+
+
+def _reconcile_indexed_exact(db, period, source_id, rule, submitter_id,
+                             active, pending):
+    """Batch matching for one exact-amount, reference-aware rule.
+
+    Uses a date-sorted in-memory index instead of performing an SQL query for
+    every incoming record. All groups, members, issues and audit events are
+    inserted in the existing PostgreSQL transaction; any constraint violation
+    rolls back the entire job. Ambiguous reverse matches are never guessed.
+    """
+    from collections import defaultdict
+    from sqlalchemy import insert, update
+
+    submitter = db.get(User, submitter_id)
+    if submitter is None or not submitter.enabled:
+        fail(409, "Reconciliation submitter no longer exists")
+
+    # Only the fields relevant for matching are materialized. Original data,
+    # normalized JSON and raw source text remain in PostgreSQL.
+    stmt = select(
+        Record.id, Record.kind, Record.account, Record.currency,
+        Record.reference, Record.amount_minor, Record.booked_date,
+    ).where(
+        Record.period_id == period.id, Record.source_id == source_id,
+    ).order_by(Record.id)
+    rows = db.execute(stmt).all()
+    internals = defaultdict(list)
+    externals = defaultdict(list)
+    any_internal = set()
+    external = []
+    for row in rows:
+        key = (row.account, row.currency, row.reference, row.amount_minor)
+        if row.kind == "internal":
+            any_internal.add((row.reference, row.account))
+            internals[key].append(row)
+        elif row.kind == "external":
+            external.append(row)
+            externals[key].append(row)
+    del rows
+
+    def build_index(buckets):
+        indexes = {}
+        for key, items in buckets.items():
+            items.sort(key=lambda row: (row.booked_date, row.id))
+            indexes[key] = ([item.booked_date for item in items], items)
+        return indexes
+
+    internal_index = build_index(internals)
+    external_index = build_index(externals)
+    del internals, externals
+
+    existing_issues = set(db.execute(
+        select(ReconcileIssue.record_id, ReconcileIssue.issue_type).where(
+            ReconcileIssue.period_id == period.id,
+            ReconcileIssue.source_id == source_id,
+        )
+    ).all())
+    new_issues = {}
+    groups = []
+    members = []
+    events = []
+    approved_ids = []
+    threshold = int(os.getenv("RISK_THRESHOLD_MINOR", "10000000"))
+    rule_id = UUID(rule["id"])
+    now = utcnow()
+    stats = {"matched": 0, "proposed": 0, "ambiguous": 0, "unmatched": 0}
+
+    def record_issue(record_id, category, candidates):
+        key = (record_id, category)
+        if key in existing_issues or key in new_issues:
+            return
+        new_issues[key] = {
+            "id": __import__("uuid").uuid4(),
+            "period_id": period.id,
+            "source_id": source_id,
+            "record_id": record_id,
+            "issue_type": category,
+            "candidates": [str(item) for item in candidates[:10]],
+            "state": "open",
+        }
+
+    forbidden = active | pending
+    for ext in external:
+        if ext.id in forbidden:
+            continue
+        found = _exact_candidates(internal_index, ext, rule["window"], forbidden)
+        if len(found) > 1:
+            record_issue(ext.id, "ambiguous", [item.id for item in found])
+            stats["ambiguous"] += 1
+            continue
+        if not found:
+            record_issue(
+                ext.id,
+                "amount_mismatch" if (ext.reference, ext.account) in any_internal else "unmatched",
+                [],
+            )
+            stats["unmatched"] += 1
+            continue
+        internal = found[0]
+        reverse = _exact_candidates(external_index, internal, rule["window"], forbidden)
+        if len(reverse) > 1:
+            candidates = [item.id for item in reverse]
+            for candidate in reverse:
+                record_issue(candidate.id, "ambiguous", candidates)
+            stats["ambiguous"] += 1
+            continue
+        # Without symmetric uniqueness, a one-to-one choice is not safe.
+        if len(reverse) != 1 or reverse[0].id != ext.id:
+            raise RuntimeError("Exact matcher detected asymmetric candidate set")
+        if internal.account != ext.account or internal.currency != ext.currency:
+            raise RuntimeError("Cross-account/currency match rejected")
+        if abs((internal.booked_date - ext.booked_date).days) > rule["window"]:
+            raise RuntimeError("Matched dates exceed rule window")
+        if ext.amount_minor != internal.amount_minor:
+            raise RuntimeError("Exact matcher detected unequal minor units")
+
+        high_risk = abs(ext.amount_minor) > threshold
+        group_id = __import__("uuid").uuid4()
+        explanation = {
+            "rule_key": rule["key"], "rule_version": rule["version"],
+            "priority": rule["priority"], "tolerance_minor": 0,
+            "day_window": rule["window"], "require_reference": True,
+            "external_record_ids": [str(ext.id)],
+            "internal_record_ids": [str(internal.id)],
+            "features": {
+                "account": ext.account, "currency": ext.currency,
+                "references": [ext.reference],
+                "date_range": [
+                    min(ext.booked_date, internal.booked_date).isoformat(),
+                    max(ext.booked_date, internal.booked_date).isoformat(),
+                ],
+            },
+        }
+        groups.append({
+            "id": group_id, "period_id": period.id, "source_id": source_id,
+            "rule_id": rule_id, "rule_version": rule["version"],
+            "state": "proposed" if high_risk else "approved",
+            "manual": False, "proposed_by": submitter_id,
+            "approved_by": None if high_risk else submitter_id,
+            "approved_at": None if high_risk else now,
+            "version": 1 if high_risk else 2,
+            "explanation": explanation, "external_minor": ext.amount_minor,
+            "internal_minor": internal.amount_minor, "delta_minor": 0,
+        })
+        members.extend([
+            {"group_id": group_id, "record_id": ext.id, "active": not high_risk},
+            {"group_id": group_id, "record_id": internal.id, "active": not high_risk},
+        ])
+        events.append({
+            "id": __import__("uuid").uuid4(), "source_id": source_id,
+            "actor_id": submitter_id,
+            "action": "match.proposed" if high_risk else "match.confirmed",
+            "entity_type": "MatchGroup", "entity_id": str(group_id),
+            "details": {
+                "manual": False, "delta_minor": 0,
+                "rule_version": rule["version"],
+                "high_risk": high_risk, "comment": None,
+            },
+        })
+        forbidden.update((ext.id, internal.id))
+        if high_risk:
+            pending.update((ext.id, internal.id))
+            stats["proposed"] += 1
+        else:
+            active.update((ext.id, internal.id))
+            approved_ids.extend((ext.id, internal.id))
+            stats["matched"] += 1
+
+    # Parent rows first, followed by membership, audit and issues.
+    _batch_insert(db, MatchGroup, groups)
+    _batch_insert(db, MatchMember, members)
+    if approved_ids:
+        for offset in range(0, len(approved_ids), 500):
+            db.execute(
+                update(ReconcileIssue).where(
+                    ReconcileIssue.record_id.in_(approved_ids[offset:offset + 500]),
+                    ReconcileIssue.state == "open",
+                ).values(state="resolved")
+            )
+    _batch_insert(db, AuditEvent, events)
+    _batch_insert(db, ReconcileIssue, list(new_issues.values()))
+    return stats
+
+
 def reconcile(db, job):
     """Idempotent rule matching: compare *all* candidates at the best matching priority."""
     from itertools import groupby
     from sqlalchemy import exists
 
     period = locked_period(db, job.period_id)
-    active = set(db.scalars(select(MatchMember.record_id).where(
-        MatchMember.active.is_(True))).all())
+    active = set(db.scalars(select(MatchMember.record_id).join(
+        Record, Record.id == MatchMember.record_id).where(
+            Record.period_id == period.id, MatchMember.active.is_(True))).all())
     pending = set(db.scalars(select(MatchMember.record_id).join(
         MatchGroup, MatchMember.group_id == MatchGroup.id).where(
-            MatchGroup.state == "proposed")).all())
+            MatchGroup.state == "proposed",
+        MatchGroup.period_id == period.id)).all())
     # SQL-level filtering avoids losing candidates behind a LIMIT when rows are already claimed.
     claimed_query = select(MatchMember.id).where(
         MatchMember.record_id == Record.id,
@@ -303,6 +516,12 @@ def reconcile(db, job):
     stats = {"matched": 0, "proposed": 0, "ambiguous": 0, "unmatched": 0}
     for source_id, rules in rules_by_source.items():
         src_uuid = UUID(source_id)
+        if len(rules) == 1 and rules[0]["require_reference"] and rules[0]["tolerance"] == 0:
+            result = _reconcile_indexed_exact(
+                db, period, src_uuid, rules[0], job.created_by, active, pending)
+            for metric, value in result.items():
+                stats[metric] += value
+            continue
         rules.sort(key=lambda r: (-r["priority"], r["key"]))
         priority_groups = [
             list(group) for _, group in groupby(rules, key=lambda r: r["priority"])
