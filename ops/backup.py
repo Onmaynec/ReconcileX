@@ -298,13 +298,17 @@ def drill_offsite(name=None):
     temporary_name = utcnow().strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     temporary = BACKUP_ROOT / temporary_name
     # The path must not already exist: off-site restore never overwrites data.
+    downloaded = False
     try:
         offsite.download_snapshot(
             target_name, temporary, client=client, config=config,
         )
+        downloaded = True
         restore_check(temporary)
     finally:
-        if temporary.exists():
+        # Do not remove another directory in the (extremely unlikely)
+        # event that the randomly generated destination already exists.
+        if downloaded and temporary.exists():
             shutil.rmtree(temporary)
     print(json.dumps({"event": "offsite_drill_verified",
                       "snapshot": target_name}), flush=True)
