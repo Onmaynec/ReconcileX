@@ -2,7 +2,7 @@
 
 ReconcileX — backend для сверки банковских выписок, платёжных реестров и внутренних операций. Не проводит реальные платежи и не подключается к банкам. Техническая постановка: PV-FIN-03, редакция 1.0.
 
-**Текущий статус:** версия 0.8.0, Security & Deployment Hardening, инженерный backend; полная промышленная приёмка ещё не завершена. Полный акт приёмки по ТЗ не подписан; непроверенные требования перечислены в docs/STATUS.md.
+**Текущий статус:** версия 0.9.0, Production Readiness, инженерный backend; полная промышленная приёмка ещё не завершена. Полный акт приёмки по ТЗ не подписан; непроверенные требования перечислены в docs/STATUS.md.
 
 ## Состав
 
@@ -75,6 +75,8 @@ Restore-check восстанавливает данные только во вр
 Опциональный TLS reverse proxy включается командой docker compose -f compose.yaml -f compose.tls.yaml up --build -d после установки валидных сертификатов в certs/ и TRUSTED_HOSTS в .env. Подробности — docs/SECURITY.md.
 
 Измерения производительности на синтетических массивах: python -m scripts.benchmark --external 80000 --internal 100000 --preview 20000 --trials 3 --output demo-output/performance.json. Сквозная нагрузочная приёмка автоматической сверки 180000 строк ещё не выполнена; см. docs/PERFORMANCE.md.
+
+Для production-развёртывания поддерживается отдельный профиль file-backed secrets. Создайте защищённые файлы для пароля PostgreSQL, JWT и S3 credentials, укажите их пути в DB_PASSWORD_FILE, JWT_SECRET_FILE, S3_ACCESS_KEY_FILE, S3_SECRET_KEY_FILE и запускайте docker compose -f compose.yaml -f compose.secrets.yaml up --build -d. Сами файлы должны храниться с ограниченными правами на хосте. Подробности — docs/SECURITY.md и docs/OPERATIONS.md.
 
 История изменений — CHANGELOG.md; точный статус требований — docs/STATUS.md.
 
@@ -162,3 +164,15 @@ python -m scripts.e2e_benchmark --pairs 80000 --internal-extra 20000 --tolerance
 - Добавлены тесты доверия к proxy, отказа от spoofed X-Real-IP, защиты конфигурации и обязательной аутентификации всех API-маршрутов.
 
 Релиз не закрывает Issue #4 целиком: внешний secret manager, MFA/SSO, полный RBAC acceptance и параллельные security испытания на целевом стенде остаются отдельными задачами. См. docs/SECURITY.md и Issue #4.
+
+
+## v0.9.0 — Production Readiness
+
+- Добавлен безопасный загрузчик секретов: обычная переменная окружения или файл по суффиксу _FILE. Одновременное задание двух непустых источников отклоняется.
+- PostgreSQL URL собирается через SQLAlchemy URL.create, специальные символы пароля корректно кодируются; поддерживается DATABASE_URL из файла.
+- Добавлен Compose-профиль compose.secrets.yaml для PostgreSQL, JWT, SILO, API, worker, bucket initializer и backup. Отдельный compose.offsite.secrets.yaml закрывает учётные данные внешнего архива и HMAC-ключ.
+- Создание bucket перенесено в идемпотентный Python initializer.
+- Добавлена приёмочная матрица пяти ролей: финансовое чтение, отчёты, история, административные изменения, аудит безопасности и доступ к исходным файлам.
+- CI проверяет Compose secret profiles и поднимает полный стек с файловыми секретами, включая backup/restore-check и TLS proxy smoke.
+
+Это не означает подключение внешнего Vault/KMS или завершение production acceptance: физическое хранение файлов и их ротация остаются обязанностью администратора развёртывания. Issue #4 остаётся открытым до реальной TLS-приёмки, MFA/SSO по требованиям окружения и независимого security review.
