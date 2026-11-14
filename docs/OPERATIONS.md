@@ -1,4 +1,4 @@
-# Эксплуатация и восстановление ReconcileX v0.8.0
+# Эксплуатация и восстановление ReconcileX v0.9.0
 
 ## Здоровье
 
@@ -128,3 +128,46 @@ docker compose -f compose.yaml -f compose.tls.yaml up --build -d
 Для endpoint входа действуют два независимых ограничения: Nginx по IP (5 запросов в минуту, burst 2) и счётчик приложения по username + доверенному IP (пять неудачных попыток за 60 секунд). При превышении ожидается HTTP 429. Nginx добавляет HSTS, X-Frame-Options и Permissions-Policy; отключён вывод версии Nginx.
 
 CI использует одноразовый self-signed сертификат только для проверки handshake и заголовков. Для реального развертывания отдельно проверьте DNS, цепочку сертификата, обновление ключа, firewall, ротацию секретов и мониторинг. Не используйте временный CI сертификат на внешнем стенде.
+
+
+## v0.9.0 — запуск с файловыми секретами
+
+### Подготовка
+
+В отдельном каталоге, не включённом в Git, создайте четыре файла: db_password, jwt_secret, s3_access_key, s3_secret_key. Установите права доступа только для deployment user (на Linux обычно chmod 600 secrets/*). В .env укажите пути к ним:
+
+~~~dotenv
+DB_PASSWORD_FILE=./secrets/db_password
+JWT_SECRET_FILE=./secrets/jwt_secret
+S3_ACCESS_KEY_FILE=./secrets/s3_access_key
+S3_SECRET_KEY_FILE=./secrets/s3_secret_key
+~~~
+
+Файлы должны содержать только значение секрета. Загрузчик удаляет завершающие CR/LF, но сохраняет остальные пробелы. Не передавайте секреты через командную строку, shell history, Git или CI artifacts.
+
+### Запуск и обслуживание
+
+~~~sh
+docker compose -f compose.yaml -f compose.secrets.yaml config -q
+docker compose -f compose.yaml -f compose.secrets.yaml up --build -d
+docker compose -f compose.yaml -f compose.secrets.yaml ps
+docker compose -f compose.yaml -f compose.secrets.yaml logs -f api worker backup
+~~~
+
+При этом профиле пароль PostgreSQL читается контейнером Postgres из POSTGRES_PASSWORD_FILE; приложение формирует DB URI из DB_PASSWORD_FILE. JWT и основные S3 credentials монтируются только в нужные сервисы. Bucket initializer использует ту же пару S3 credentials и безопасно завершается, если bucket уже существует.
+
+Для ручного backup/restore используйте те же два Compose-файла:
+
+~~~sh
+docker compose -f compose.yaml -f compose.secrets.yaml run --rm backup once
+docker compose -f compose.yaml -f compose.secrets.yaml run --rm backup verify
+docker compose -f compose.yaml -f compose.secrets.yaml run --rm backup restore-check
+~~~
+
+Для TLS добавьте -f compose.tls.yaml. Для off-site архива с отдельными файловыми ключами добавьте -f compose.offsite.yaml -f compose.offsite.secrets.yaml; предварительно заполните endpoint/bucket и пути трёх off-site secret files.
+
+### Ротация
+
+Ротация файлов не меняет секрет внутри уже работающего процесса. Согласуйте замену паролей на стороне PostgreSQL/SILO и приложения, обновите файлы и пересоздайте зависимые сервисы. Не меняйте пароль БД только в одном из мест: иначе backup или API потеряет подключение. Для HMAC off-site старые снимки могут требовать старого ключа при проверке; сохраните его в защищённом архиве до окончания retention периода.
+
+File-backed secrets не заменяют Vault/KMS, права на хосте и резервирование ключей. Не считайте наличие _FILE доказательством безопасного хранения.
