@@ -711,3 +711,138 @@ def test_indexed_rule_high_risk_keeps_four_eyes_proposal(setup):
         json={"expected_version": 1}, headers=headers(tokens, "controller"))
     assert accepted.status_code == 200, accepted.text
     assert accepted.json()["state"] == "approved"
+
+
+
+def _set_tolerant_rule(ids, cents=5):
+    """Update the rule before queuing a job, preserving the test source."""
+    with SessionLocal.begin() as db:
+        rule = db.get(MatchRule, ids["rule"])
+        rule.tolerance_minor = cents
+
+
+def test_tolerant_indexed_matching_keeps_exact_minor_unit_deltas(setup):
+    from app.models import MatchGroup, ReconcileIssue
+    ids, tokens = setup
+    _set_tolerant_rule(ids, 5)
+    # 620 pairs cross the 500-write boundary. Amounts deliberately differ.
+    pairs = 620
+    ext = fixture_lines(*[
+        (f"TOL-{i:05d}", f"2026-09-{(i % 28) + 1:02d}", "10.00")
+        for i in range(pairs)])
+    internal = "reference,date,amount,origin\n" + "".join(
+        f"TOL-{i:05d},2026-09-{(i % 28) + 1:02d},"
+        f"{'9.97' if i % 2 == 0 else '10.02'},internal\n"
+        for i in range(pairs))
+    assert import_rows(ids, tokens, "external", ext).status_code == 200
+    assert import_rows(ids, tokens, "internal", internal).status_code == 200
+    job = client.post("/api/v1/reconciliation/run",
+                      headers=headers(tokens, key="tolerance-bulk-v060-001"),
+                      params={"period_id": str(ids["period"])})
+    assert job.status_code == 202, job.text
+    assert run_once()
+    with SessionLocal() as db:
+        groups = db.scalars(select(MatchGroup).where(
+            MatchGroup.period_id == ids["period"],
+            MatchGroup.source_id == ids["source"])).all()
+        assert len(groups) == pairs
+        assert all(g.state == "approved" for g in groups)
+        assert sorted([g.delta_minor for g in groups]) == [(-2)] * (pairs // 2) + [3] * (pairs // 2)
+        assert all(g.explanation["tolerance_minor"] == 5 for g in groups)
+        assert db.scalar(select(func.count(MatchMember.id)).join(
+            MatchGroup, MatchMember.group_id == MatchGroup.id).where(
+            MatchGroup.period_id == ids["period"],
+            MatchMember.active.is_(True))) == 2 * pairs
+        assert not db.scalar(select(ReconcileIssue.id).where(
+            ReconcileIssue.period_id == ids["period"]))
+        logs = db.scalars(select(AuditEvent).where(
+            AuditEvent.source_id == ids["source"],
+            AuditEvent.action == "match.confirmed")).all()
+        assert len(logs) == pairs
+        assert sum(x.details["delta_minor"] for x in logs) == pairs // 2
+    repeat = client.post("/api/v1/reconciliation/run",
+                         headers=headers(tokens, key="tolerance-bulk-v060-002"),
+                         params={"period_id": str(ids["period"])})
+    assert repeat.status_code == 202
+    assert run_once()
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count(MatchGroup.id)).where(
+            MatchGroup.period_id == ids["period"])) == pairs
+
+
+def test_tolerant_indexed_rule_never_guesses_forward_or_reverse_ambiguity(setup):
+    from app.models import MatchGroup, ReconcileIssue
+    ids, tokens = setup
+    _set_tolerant_rule(ids, 5)
+    assert import_rows(ids, tokens, "external", fixture_lines(
+        ("FWD", "2026-09-15", "10.00"),
+        ("REV", "2026-09-16", "20.00"),
+        ("REV", "2026-09-17", "20.02"))).status_code == 200
+    assert import_rows(ids, tokens, "internal", fixture_lines(
+        ("FWD", "2026-09-15", "9.98"),
+        ("FWD", "2026-09-15", "10.03"),
+        ("REV", "2026-09-16", "20.01"))).status_code == 200
+    job = client.post("/api/v1/reconciliation/run",
+                      headers=headers(tokens, key="tolerance-ambig-v060-001"),
+                      params={"period_id": str(ids["period"])})
+    assert job.status_code == 202
+    assert run_once()
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count(MatchGroup.id)).where(
+            MatchGroup.period_id == ids["period"])) == 0
+        ambiguous = db.scalars(select(ReconcileIssue).where(
+            ReconcileIssue.period_id == ids["period"],
+            ReconcileIssue.issue_type == "ambiguous")).all()
+        assert len(ambiguous) == 3
+        assert all(len(i.candidates) >= 2 for i in ambiguous)
+
+
+def test_tolerant_indexed_rule_does_not_match_outside_amount_or_date_window(setup):
+    from app.models import MatchGroup, ReconcileIssue
+    ids, tokens = setup
+    _set_tolerant_rule(ids, 5)
+    assert import_rows(ids, tokens, "external", fixture_lines(
+        ("OVER", "2026-09-15", "10.00"),
+        ("DATE", "2026-09-15", "20.00"))).status_code == 200
+    assert import_rows(ids, tokens, "internal", fixture_lines(
+        ("OVER", "2026-09-15", "9.94"),
+        ("DATE", "2026-09-18", "20.03"))).status_code == 200
+    job = client.post("/api/v1/reconciliation/run",
+                      headers=headers(tokens, key="tolerance-bounds-v060-001"),
+                      params={"period_id": str(ids["period"])})
+    assert job.status_code == 202
+    assert run_once()
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count(MatchGroup.id)).where(
+            MatchGroup.period_id == ids["period"])) == 0
+        assert db.scalar(select(func.count(ReconcileIssue.id)).where(
+            ReconcileIssue.period_id == ids["period"])) == 2
+
+
+def test_tolerant_indexed_rule_high_risk_still_requires_controller(setup):
+    from app.models import MatchGroup
+    ids, tokens = setup
+    _set_tolerant_rule(ids, 5)
+    assert import_rows(ids, tokens, "external", fixture_lines(
+        ("HIGH-TOL", "2026-09-15", "1500.00"))).status_code == 200
+    assert import_rows(ids, tokens, "internal", fixture_lines(
+        ("HIGH-TOL", "2026-09-15", "1499.99"))).status_code == 200
+    job = client.post("/api/v1/reconciliation/run",
+                      headers=headers(tokens, key="tolerance-four-eyes-v060-001"),
+                      params={"period_id": str(ids["period"])})
+    assert job.status_code == 202
+    assert run_once()
+    with SessionLocal() as db:
+        group = db.scalar(select(MatchGroup).where(
+            MatchGroup.period_id == ids["period"]))
+        assert group.state == "proposed" and group.delta_minor == 1
+        assert group.explanation["tolerance_minor"] == 5
+        group_id = group.id
+    deny = client.post(f"/api/v1/match-groups/{group_id}/approve",
+                       headers=headers(tokens),
+                       json={"expected_version": 1})
+    assert deny.status_code == 403
+    yes = client.post(f"/api/v1/match-groups/{group_id}/approve",
+                      headers=headers(tokens, role="controller"),
+                      json={"expected_version": 1})
+    assert yes.status_code == 200 and yes.json()["state"] == "approved"

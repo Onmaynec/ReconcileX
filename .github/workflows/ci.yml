@@ -63,6 +63,17 @@ jobs:
           name: reconcilex-e2e-synthetic
           path: /tmp/reconcilex-e2e.json
           retention-days: 14
+      - name: Synthetic tolerant reconciliation financial acceptance
+        run: >-
+          python -m scripts.e2e_benchmark
+          --pairs 250 --internal-extra 50 --external-extra 25
+          --tolerance-minor 5 --drift-minor 3
+          --output /tmp/reconcilex-e2e-tolerant.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reconcilex-e2e-tolerant-synthetic
+          path: /tmp/reconcilex-e2e-tolerant.json
+          retention-days: 14
       - run: python -c "from app.api import app; assert '/api/v1/imports/commit' in app.openapi()['paths']"
       - name: HTTP application startup
         run: |

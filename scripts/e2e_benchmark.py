@@ -26,13 +26,15 @@ from app.worker import run_once
 from scripts.benchmark import host_details, memory_mib
 
 
-def make_file(kind, pairs, internal_extra, external_extra):
-    """A pair shares reference/date/amount, but bytes differ by origin field."""
+def make_file(kind, pairs, internal_extra, external_extra, drift_minor=0):
+    """Deterministic synthetic pairs with optional exact minor-unit mismatch."""
     rows = ["reference,date,amount,origin\n"]
     count = pairs + (internal_extra if kind == "internal" else external_extra)
     for i in range(count):
         ref = f"PAIR-{i:08d}" if i < pairs else f"{kind.upper()}-ONLY-{i:08d}"
-        rows.append(f"{ref},2099-01-{(i % 28) + 1:02d},10.00,{kind}\n")
+        cents = 1000 - drift_minor if kind == "internal" and i < pairs else 1000
+        amount = f"{cents // 100}.{cents % 100:02d}"
+        rows.append(f"{ref},2099-01-{(i % 28) + 1:02d},{amount},{kind}\n")
     return "".join(rows).encode("utf-8")
 
 
@@ -54,7 +56,7 @@ def checked(response, status):
 
 
 def run_benchmark(pairs=80000, internal_extra=20000, external_extra=0,
-                  repeat_import=True):
+                  repeat_import=True, tolerance_minor=0, drift_minor=0):
     db_url = os.environ.get("DATABASE_URL", "")
     if not db_url:
         raise RuntimeError("DATABASE_URL is required")
@@ -65,6 +67,8 @@ def run_benchmark(pairs=80000, internal_extra=20000, external_extra=0,
         raise ValueError("At least one pair and nonnegative extra rows required")
     if max(pairs + internal_extra, pairs + external_extra) > 250000:
         raise ValueError("Maximum 250000 rows per file")
+    if not 0 <= tolerance_minor <= 1000000 or not 0 <= drift_minor <= min(tolerance_minor, 999):
+        raise ValueError("Minor-unit drift must be <= tolerance and <= 999; tolerance >= 0")
     suffix = uuid.uuid4().hex[:12]
     timeline = {}
     start = time.perf_counter()
@@ -88,8 +92,8 @@ def run_benchmark(pairs=80000, internal_extra=20000, external_extra=0,
             mapping={"reference": "reference", "date": "date", "amount": "amount"},
         )
         rule = MatchRule(
-            source_id=source.id, rule_key="exact-perf", version=1,
-            priority=100, day_window=2, tolerance_minor=0,
+            source_id=source.id, rule_key="reference-perf", version=1,
+            priority=100, day_window=2, tolerance_minor=tolerance_minor,
             require_reference=True,
         )
         db.add_all((profile, rule))
@@ -101,7 +105,7 @@ def run_benchmark(pairs=80000, internal_extra=20000, external_extra=0,
     client = TestClient(app)
 
     inputs = {
-        kind: make_file(kind, pairs, internal_extra, external_extra)
+        kind: make_file(kind, pairs, internal_extra, external_extra, drift_minor)
         for kind in ("external", "internal")
     }
     preview = {}
@@ -195,14 +199,26 @@ def run_benchmark(pairs=80000, internal_extra=20000, external_extra=0,
                 f"Financial match invariant failed: groups={group_count}, members={members}")
         expected = {"external": pairs + external_extra,
                     "internal": pairs + internal_extra}
+        expected_minor = {
+            "external": expected["external"] * 1000,
+            "internal": expected["internal"] * 1000 - pairs * drift_minor,
+        }
         for kind, count, amount in records:
-            if count != expected[kind] or amount != count * 1000:
+            if count != expected[kind] or amount != expected_minor[kind]:
                 raise RuntimeError("Record count/minor-unit total mismatch")
+        approved_delta = db.scalar(select(func.coalesce(func.sum(MatchGroup.delta_minor), 0)).where(
+            MatchGroup.period_id == period_id,
+            MatchGroup.source_id == source_id,
+            MatchGroup.state == "approved",
+        ))
+        if approved_delta != pairs * drift_minor:
+            raise RuntimeError("Matched financial delta differs from expected minor units")
         if issues != external_extra:
             raise RuntimeError(f"Expected {external_extra} unmatched external, got {issues}")
     timeline["verified"] = {
         "approved_groups": group_count, "active_members": members,
         "open_issues": issues,
+        "approved_delta_minor": int(approved_delta),
         "totals_minor": {kind: int(total) for kind, _, total in records},
         "row_counts": {kind: count for kind, count, _ in records},
     }
@@ -226,7 +242,10 @@ def run_benchmark(pairs=80000, internal_extra=20000, external_extra=0,
         "memory_peak_mib": memory_mib(),
         "external_rows": pairs + external_extra,
         "internal_rows": pairs + internal_extra,
-        "pairs": pairs, "results": timeline,
+        "pairs": pairs, "tolerance_minor": tolerance_minor,
+        "drift_minor": drift_minor,
+        "matcher_mode": "indexed_tolerance" if tolerance_minor else "indexed_exact",
+        "results": timeline,
     }
 
 
@@ -235,6 +254,8 @@ def main():
     parser.add_argument("--pairs", type=int, default=80000)
     parser.add_argument("--internal-extra", type=int, default=20000)
     parser.add_argument("--external-extra", type=int, default=0)
+    parser.add_argument("--tolerance-minor", type=int, default=0)
+    parser.add_argument("--drift-minor", type=int, default=0)
     parser.add_argument("--no-repeat", action="store_true")
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--output")
@@ -243,7 +264,7 @@ def main():
         parser.error("--runs must be in 1..10")
     measurements = [
         run_benchmark(args.pairs, args.internal_extra, args.external_extra,
-                      not args.no_repeat)
+                      not args.no_repeat, args.tolerance_minor, args.drift_minor)
         for _ in range(args.runs)
     ]
     result = measurements[0] if args.runs == 1 else {

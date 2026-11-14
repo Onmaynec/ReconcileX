@@ -306,34 +306,58 @@ def _batch_insert(db, model, values, size=500):
         db.execute(insert(model), values[offset:offset + size])
 
 
-def _exact_candidates(index, record, window, forbidden, maximum=11):
-    """Find up to maximum unclaimed, same-reference 1:1 candidates."""
+def _indexed_candidates(index, record, window, forbidden,
+                        tolerance=0, maximum=11):
+    """Up to maximum candidates within date and amount limits.
+
+    For exact matching date-sorted arrays reduce the search to the date
+    window. For nonzero tolerances amount-sorted arrays constrain the money
+    range first. Every candidate is then checked against the date window;
+    the reverse lookup prevents choosing an arbitrary 1:1 pair.
+    """
     from bisect import bisect_left, bisect_right
 
-    key = (record.account, record.currency, record.reference, record.amount_minor)
+    if tolerance == 0:
+        key = (record.account, record.currency, record.reference,
+               record.amount_minor)
+        group = index.get(key)
+        if not group:
+            return []
+        dates, entries = group
+        lo = bisect_left(dates, record.booked_date - timedelta(days=window))
+        hi = bisect_right(dates, record.booked_date + timedelta(days=window))
+        result = []
+        for item in entries[lo:hi]:
+            if item.id not in forbidden:
+                result.append(item)
+                if len(result) >= maximum:
+                    break
+        return result
+
+    key = (record.account, record.currency, record.reference)
     group = index.get(key)
     if not group:
         return []
-    dates, entries = group
-    lo = bisect_left(dates, record.booked_date - timedelta(days=window))
-    hi = bisect_right(dates, record.booked_date + timedelta(days=window))
+    amounts, entries = group
+    lo = bisect_left(amounts, record.amount_minor - tolerance)
+    hi = bisect_right(amounts, record.amount_minor + tolerance)
     result = []
     for item in entries[lo:hi]:
-        if item.id not in forbidden:
+        if (item.id not in forbidden and
+                abs((item.booked_date - record.booked_date).days) <= window):
             result.append(item)
-            if len(result) == maximum:
+            if len(result) >= maximum:
                 break
     return result
 
 
-def _reconcile_indexed_exact(db, period, source_id, rule, submitter_id,
-                             active, pending):
-    """Batch matching for one exact-amount, reference-aware rule.
+def _reconcile_indexed_reference(db, period, source_id, rule, submitter_id,
+                                 active, pending):
+    """Batch matching for a single reference-aware rule with any tolerance.
 
-    Uses a date-sorted in-memory index instead of performing an SQL query for
-    every incoming record. All groups, members, issues and audit events are
-    inserted in the existing PostgreSQL transaction; any constraint violation
-    rolls back the entire job. Ambiguous reverse matches are never guessed.
+    Date/amount indexed candidates avoid one SQL query per row; the reverse
+    check preserves symmetric uniqueness. Groups, members, issues and audit
+    are committed as one transaction, never as partial results.
     """
     from collections import defaultdict
     from sqlalchemy import update
@@ -355,8 +379,11 @@ def _reconcile_indexed_exact(db, period, source_id, rule, submitter_id,
     externals = defaultdict(list)
     any_internal = set()
     external = []
+    tolerance = int(rule["tolerance"])
     for row in rows:
-        key = (row.account, row.currency, row.reference, row.amount_minor)
+        key = ((row.account, row.currency, row.reference, row.amount_minor)
+               if tolerance == 0
+               else (row.account, row.currency, row.reference))
         if row.kind == "internal":
             any_internal.add((row.reference, row.account))
             internals[key].append(row)
@@ -368,8 +395,12 @@ def _reconcile_indexed_exact(db, period, source_id, rule, submitter_id,
     def build_index(buckets):
         indexes = {}
         for key, items in buckets.items():
-            items.sort(key=lambda row: (row.booked_date, row.id))
-            indexes[key] = ([item.booked_date for item in items], items)
+            if tolerance == 0:
+                items.sort(key=lambda row: (row.booked_date, row.id))
+                indexes[key] = ([item.booked_date for item in items], items)
+            else:
+                items.sort(key=lambda row: (row.amount_minor, row.booked_date, row.id))
+                indexes[key] = ([item.amount_minor for item in items], items)
         return indexes
 
     internal_index = build_index(internals)
@@ -438,7 +469,8 @@ def _reconcile_indexed_exact(db, period, source_id, rule, submitter_id,
     for ext in external:
         if ext.id in forbidden:
             continue
-        found = _exact_candidates(internal_index, ext, rule["window"], forbidden)
+        found = _indexed_candidates(internal_index, ext, rule["window"],
+                                    forbidden, tolerance)
         if len(found) > 1:
             record_issue(ext.id, "ambiguous", [item.id for item in found])
             stats["ambiguous"] += 1
@@ -452,7 +484,8 @@ def _reconcile_indexed_exact(db, period, source_id, rule, submitter_id,
             stats["unmatched"] += 1
             continue
         internal = found[0]
-        reverse = _exact_candidates(external_index, internal, rule["window"], forbidden)
+        reverse = _indexed_candidates(external_index, internal, rule["window"],
+                                      forbidden, tolerance)
         if len(reverse) > 1:
             candidates = [item.id for item in reverse]
             for candidate in reverse:
@@ -466,14 +499,15 @@ def _reconcile_indexed_exact(db, period, source_id, rule, submitter_id,
             raise RuntimeError("Cross-account/currency match rejected")
         if abs((internal.booked_date - ext.booked_date).days) > rule["window"]:
             raise RuntimeError("Matched dates exceed rule window")
-        if ext.amount_minor != internal.amount_minor:
-            raise RuntimeError("Exact matcher detected unequal minor units")
+        delta = ext.amount_minor - internal.amount_minor
+        if abs(delta) > tolerance:
+            raise RuntimeError("Indexed matcher detected out-of-tolerance amounts")
 
-        high_risk = abs(ext.amount_minor) > threshold
+        high_risk = max(abs(ext.amount_minor), abs(internal.amount_minor)) > threshold
         group_id = __import__("uuid").uuid4()
         explanation = {
             "rule_key": rule["key"], "rule_version": rule["version"],
-            "priority": rule["priority"], "tolerance_minor": 0,
+            "priority": rule["priority"], "tolerance_minor": tolerance,
             "day_window": rule["window"], "require_reference": True,
             "external_record_ids": [str(ext.id)],
             "internal_record_ids": [str(internal.id)],
@@ -495,7 +529,7 @@ def _reconcile_indexed_exact(db, period, source_id, rule, submitter_id,
             "approved_at": None if high_risk else now,
             "version": 1 if high_risk else 2,
             "explanation": explanation, "external_minor": ext.amount_minor,
-            "internal_minor": internal.amount_minor, "delta_minor": 0,
+            "internal_minor": internal.amount_minor, "delta_minor": delta,
         })
         members.extend([
             {"group_id": group_id, "record_id": ext.id, "active": not high_risk},
@@ -507,7 +541,7 @@ def _reconcile_indexed_exact(db, period, source_id, rule, submitter_id,
             "action": "match.proposed" if high_risk else "match.confirmed",
             "entity_type": "MatchGroup", "entity_id": str(group_id),
             "details": {
-                "manual": False, "delta_minor": 0,
+                "manual": False, "delta_minor": delta,
                 "rule_version": rule["version"],
                 "high_risk": high_risk, "comment": None,
             },
@@ -564,8 +598,8 @@ def reconcile(db, job):
     stats = {"matched": 0, "proposed": 0, "ambiguous": 0, "unmatched": 0}
     for source_id, rules in rules_by_source.items():
         src_uuid = UUID(source_id)
-        if len(rules) == 1 and rules[0]["require_reference"] and rules[0]["tolerance"] == 0:
-            result = _reconcile_indexed_exact(
+        if len(rules) == 1 and rules[0]["require_reference"]:
+            result = _reconcile_indexed_reference(
                 db, period, src_uuid, rules[0], job.created_by, active, pending)
             for metric, value in result.items():
                 stats[metric] += value
