@@ -56,7 +56,8 @@ def checked(response, status):
 
 
 def run_benchmark(pairs=80000, internal_extra=20000, external_extra=0,
-                  repeat_import=True, tolerance_minor=0, drift_minor=0):
+                  repeat_import=True, tolerance_minor=0, drift_minor=0,
+                  rules_mode="single"):
     db_url = os.environ.get("DATABASE_URL", "")
     if not db_url:
         raise RuntimeError("DATABASE_URL is required")
@@ -69,6 +70,8 @@ def run_benchmark(pairs=80000, internal_extra=20000, external_extra=0,
         raise ValueError("Maximum 250000 rows per file")
     if not 0 <= tolerance_minor <= 1000000 or not 0 <= drift_minor <= min(tolerance_minor, 999):
         raise ValueError("Minor-unit drift must be <= tolerance and <= 999; tolerance >= 0")
+    if rules_mode not in {"single", "priority-fallback"}:
+        raise ValueError("Invalid rules mode")
     suffix = uuid.uuid4().hex[:12]
     timeline = {}
     start = time.perf_counter()
@@ -93,10 +96,17 @@ def run_benchmark(pairs=80000, internal_extra=20000, external_extra=0,
         )
         rule = MatchRule(
             source_id=source.id, rule_key="reference-perf", version=1,
-            priority=100, day_window=2, tolerance_minor=tolerance_minor,
+            priority=100, day_window=2,
+            tolerance_minor=0 if rules_mode == "priority-fallback" else tolerance_minor,
             require_reference=True,
         )
         db.add_all((profile, rule))
+        if rules_mode == "priority-fallback":
+            db.add(MatchRule(
+                source_id=source.id, rule_key="fallback-tolerant-perf", version=1,
+                priority=90, day_window=2, tolerance_minor=tolerance_minor,
+                require_reference=True,
+            ))
         db.flush()
         source_id, period_id, profile_id = source.id, period.id, profile.id
         operator_token = token_for(operator)
@@ -197,6 +207,17 @@ def run_benchmark(pairs=80000, internal_extra=20000, external_extra=0,
         if group_count != pairs or members != pairs * 2:
             raise RuntimeError(
                 f"Financial match invariant failed: groups={group_count}, members={members}")
+        if rules_mode == "priority-fallback":
+            selected_rule_key = (
+                "fallback-tolerant-perf" if drift_minor else "reference-perf")
+            unexpected = db.scalar(select(func.count(MatchGroup.id)).join(
+                MatchRule, MatchRule.id == MatchGroup.rule_id).where(
+                MatchGroup.period_id == period_id,
+                MatchGroup.source_id == source_id,
+                MatchRule.rule_key != selected_rule_key,
+            ))
+            if unexpected:
+                raise RuntimeError("Reconciliation selected a rule at the wrong priority")
         expected = {"external": pairs + external_extra,
                     "internal": pairs + internal_extra}
         expected_minor = {
@@ -244,8 +265,9 @@ def run_benchmark(pairs=80000, internal_extra=20000, external_extra=0,
         "internal_rows": pairs + internal_extra,
         "pairs": pairs, "tolerance_minor": tolerance_minor,
         "drift_minor": drift_minor,
-        "matcher_mode": "indexed_tolerance" if tolerance_minor else "indexed_exact",
-        "results": timeline,
+        "matcher_mode": "indexed_multi_rule" if rules_mode != "single" else
+                        ("indexed_tolerance" if tolerance_minor else "indexed_exact"),
+        "rules_mode": rules_mode, "results": timeline,
     }
 
 
@@ -256,6 +278,8 @@ def main():
     parser.add_argument("--external-extra", type=int, default=0)
     parser.add_argument("--tolerance-minor", type=int, default=0)
     parser.add_argument("--drift-minor", type=int, default=0)
+    parser.add_argument("--rules-mode", choices=("single", "priority-fallback"),
+                        default="single")
     parser.add_argument("--no-repeat", action="store_true")
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--output")
@@ -264,7 +288,8 @@ def main():
         parser.error("--runs must be in 1..10")
     measurements = [
         run_benchmark(args.pairs, args.internal_extra, args.external_extra,
-                      not args.no_repeat, args.tolerance_minor, args.drift_minor)
+                      not args.no_repeat, args.tolerance_minor, args.drift_minor,
+                      args.rules_mode)
         for _ in range(args.runs)
     ]
     result = measurements[0] if args.runs == 1 else {
