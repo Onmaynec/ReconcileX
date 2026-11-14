@@ -601,7 +601,7 @@ def test_indexed_reconciliation_bulk_pairs_and_repeat_are_idempotent(setup):
     """Fast single-rule path must preserve every original financial invariant."""
     from app.models import MatchGroup, ReconcileIssue
     ids, tokens = setup
-    pairs = 320
+    pairs = 620  # exercise two full write batches and a final partial one
     rows = [(f"FAST-{i:05d}", f"2026-09-{(i % 28) + 1:02d}", "10.00")
             for i in range(pairs)]
     assert import_rows(ids, tokens, "external", fixture_lines(*rows)).status_code == 200
@@ -627,6 +627,9 @@ def test_indexed_reconciliation_bulk_pairs_and_repeat_are_idempotent(setup):
                 MatchGroup.period_id == ids["period"],
                 MatchMember.active.is_(True)))
         assert active_members == pairs * 2
+        assert db.scalar(select(func.count(AuditEvent.id)).where(
+            AuditEvent.source_id == ids["source"],
+            AuditEvent.action == "match.confirmed")) == pairs
         assert db.scalar(select(func.count(ReconcileIssue.id)).where(
             ReconcileIssue.period_id == ids["period"])) == 0
     repeat = client.post(
