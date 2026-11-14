@@ -10,7 +10,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.models import (
-    AuditEvent, ImportBatch, MatchGroup, MatchMember, MatchRule, Period,
+    AuditEvent, ImportBatch, MatchGroup, MatchMember, MatchRule, Period, PeriodSnapshot,
     ReconcileIssue, Record, ReconcileJob, Source, utcnow,
 )
 from app.security import ensure_source, require_role
@@ -436,6 +436,10 @@ def close_period(db, period_id, actor):
     period.closed_by = actor.id
     period.closed_at = utcnow()
     period.version += 1
+    db.add(PeriodSnapshot(
+        period_id=period.id, sequence=period.version,
+        content=snapshot, sha256=checksum, closed_by=actor.id,
+    ))
     audit(db, actor, "period.closed", "Period", period.id,
           {"sha256": checksum, "batch_count": len(batches)})
     return period
