@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.8.0 — Security & Deployment Hardening
+
+### Периметр и авторизация
+- Добавлена проверка доверенного reverse proxy: приложение принимает X-Real-IP только от IP, входящего в TRUSTED_PROXY_CIDRS. Прямой клиент не может подменить адрес через forwarded headers.
+- Login throttle по username + client IP теперь использует доверенный адрес клиента, а не общий адрес контейнера Nginx.
+- TLS reverse proxy получил отдельный Nginx rate limit для /api/v1/auth/token: 5 запросов в минуту на IP, ограниченный burst и HTTP 429.
+- В Compose закреплён статический IP TLS proxy; адрес подсети и trusted CIDR вынесены в конфигурацию.
+- Добавлены X-Frame-Options, Permissions-Policy, server_tokens off; сохранены HSTS, nosniff, no-referrer и TLS 1.2/1.3.
+- CI запускает TLS proxy с временным сертификатом, проверяет HTTPS health endpoint, защитные заголовки и отказ при превышении лимита входа.
+
+### Регрессионные проверки
+- Проверено игнорирование поддельного X-Real-IP от прямого и недоверенного peer.
+- Проверено принятие forwarded IP только от явно закреплённого proxy.
+- Проверены malformed forwarded header и ошибочный CIDR.
+- Добавлен контрактный тест: все /api/v1/* маршруты, кроме endpoint выдачи токена, требуют current_user.
+- Проверены admin inspection endpoints для всех четырёх неадминистративных ролей и успешный доступ admin.
+
+### Ограничения
+Issue #4 остаётся открытым: полная RBAC-матрица по всем операциям, внешний secret manager, MFA/SSO, формальный параллельный security acceptance и эксплуатационная проверка сертификатов в реальном домене требуют отдельной приёмки. Наличие TLS smoke с временным сертификатом не доказывает корректность production TLS-развёртывания.
+### Совместимость
+Миграций PostgreSQL нет. Для стандартного локального профиля дополнительных настроек не требуется. При изменении docker subnet необходимо синхронно изменить BACKEND_SUBNET, TLS_PROXY_IP и TRUSTED_PROXY_CIDRS.
+
 ## 0.7.0 — Multi-Rule Engine
 
 ### Сверка
