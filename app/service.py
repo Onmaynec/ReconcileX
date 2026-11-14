@@ -501,7 +501,11 @@ def _reconcile_indexed_rules(db, period, source_id, rules, submitter_id,
 
             reverse = collect(external_index, internal_row, priority_rules, forbidden)
             if len(reverse) > 1:
+                # Reverse candidates are intentionally capped. The current
+                # external record might fall beyond that cap: it still needs
+                # its own ambiguity issue rather than disappearing silently.
                 reverse_ids = list(reverse)
+                record_issue(ext.id, "ambiguous", [ext.id] + reverse_ids)
                 for candidate in reverse.values():
                     record_issue(candidate[0].id, "ambiguous", reverse_ids)
                 stats["ambiguous"] += 1
