@@ -236,10 +236,29 @@ def main():
     parser.add_argument("--internal-extra", type=int, default=20000)
     parser.add_argument("--external-extra", type=int, default=0)
     parser.add_argument("--no-repeat", action="store_true")
+    parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--output")
     args = parser.parse_args()
-    result = run_benchmark(args.pairs, args.internal_extra, args.external_extra,
-                           not args.no_repeat)
+    if not 1 <= args.runs <= 10:
+        parser.error("--runs must be in 1..10")
+    measurements = [
+        run_benchmark(args.pairs, args.internal_extra, args.external_extra,
+                      not args.no_repeat)
+        for _ in range(args.runs)
+    ]
+    result = measurements[0] if args.runs == 1 else {
+        "scenario": "PV-FIN-03-e2e",
+        "data_kind": "synthetic", "runs": measurements,
+        "latency_ms": {
+            stage: {
+                "p50": sorted(run["results"][stage] for run in measurements)[
+                    (args.runs - 1) // 2],
+                "p95": sorted(run["results"][stage] for run in measurements)[
+                    max(0, (95 * args.runs + 99) // 100 - 1)],
+            }
+            for stage in ("reconcile_ms", "close_ms", "wall_ms")
+        },
+    }
     data = json.dumps(result, ensure_ascii=False, indent=2)
     if args.output:
         from pathlib import Path
