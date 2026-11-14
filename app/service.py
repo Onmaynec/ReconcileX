@@ -275,8 +275,25 @@ def cancel_group(db, group_id, actor, reason, expected_version):
 
 
 def reconcile(db, job):
-    """Run within the same DB transaction as the locked job row; crash rolls back everything."""
+    """Idempotent rule matching: compare *all* candidates at the best matching priority."""
+    from itertools import groupby
+    from sqlalchemy import exists
+
     period = locked_period(db, job.period_id)
+    active = set(db.scalars(select(MatchMember.record_id).where(
+        MatchMember.active.is_(True))).all())
+    pending = set(db.scalars(select(MatchMember.record_id).join(
+        MatchGroup, MatchMember.group_id == MatchGroup.id).where(
+            MatchGroup.state == "proposed")).all())
+    # SQL-level filtering avoids losing candidates behind a LIMIT when rows are already claimed.
+    claimed_query = select(MatchMember.id).where(
+        MatchMember.record_id == Record.id,
+        MatchMember.active.is_(True)).correlate(Record).exists()
+    pending_query = select(MatchMember.id).join(
+        MatchGroup, MatchMember.group_id == MatchGroup.id).where(
+            MatchMember.record_id == Record.id,
+            MatchGroup.state == "proposed").correlate(Record).exists()
+
     rules_by_source = {}
     for rule in job.rules_snapshot:
         rules_by_source.setdefault(rule["source_id"], []).append(rule)
@@ -284,64 +301,76 @@ def reconcile(db, job):
     for source_id, rules in rules_by_source.items():
         src_uuid = UUID(source_id)
         rules.sort(key=lambda r: (-r["priority"], r["key"]))
+        priority_groups = [
+            list(group) for _, group in groupby(rules, key=lambda r: r["priority"])
+        ]
         external = db.scalars(select(Record).where(
             Record.period_id == period.id, Record.source_id == src_uuid,
             Record.kind == "external").order_by(Record.id)).all()
         for ext in external:
-            if not _available(db, ext.id) or _existing_proposal(db, ext.id):
+            if ext.id in active or ext.id in pending:
                 continue
             winner, ambiguous = None, False
-            for rule in rules:
-                base = select(Record).where(
-                    Record.period_id == period.id, Record.source_id == src_uuid,
-                    Record.kind == "internal", Record.account == ext.account,
-                    Record.currency == ext.currency,
-                    Record.booked_date.between(
-                        ext.booked_date - timedelta(days=rule["window"]),
-                        ext.booked_date + timedelta(days=rule["window"]),
-                    ),
-                    Record.amount_minor.between(
-                        ext.amount_minor - rule["tolerance"],
-                        ext.amount_minor + rule["tolerance"],
-                    ),
-                )
-                if rule["require_reference"]:
-                    base = base.where(Record.reference == ext.reference)
-                candidates = [r for r in db.scalars(base.limit(30)).all()
-                              if _available(db, r.id) and not _existing_proposal(db, r.id)]
+            for rules_at_priority in priority_groups:
+                candidates = {}
+                for rule in rules_at_priority:
+                    stmt = select(Record).where(
+                        Record.period_id == period.id,
+                        Record.source_id == src_uuid,
+                        Record.kind == "internal",
+                        Record.account == ext.account,
+                        Record.currency == ext.currency,
+                        Record.booked_date.between(
+                            ext.booked_date - timedelta(days=rule["window"]),
+                            ext.booked_date + timedelta(days=rule["window"])),
+                        Record.amount_minor.between(
+                            ext.amount_minor - rule["tolerance"],
+                            ext.amount_minor + rule["tolerance"]),
+                        ~claimed_query, ~pending_query,
+                    )
+                    if rule["require_reference"]:
+                        stmt = stmt.where(Record.reference == ext.reference)
+                    for item in db.scalars(stmt.limit(11)):
+                        candidates.setdefault(item.id, (item, rule))
                 if not candidates:
                     continue
-                if len(candidates) > 1:
-                    _issue(db, ext, "ambiguous", [str(r.id) for r in candidates])
+                if len(candidates) != 1:
+                    _issue(db, ext, "ambiguous", [str(x) for x in candidates])
                     stats["ambiguous"] += 1
                     ambiguous = True
                     break
-                only = candidates[0]
-                reverse_stmt = select(Record).where(
-                    Record.period_id == period.id, Record.source_id == src_uuid,
-                    Record.kind == "external", Record.account == only.account,
-                    Record.currency == only.currency,
-                    Record.booked_date.between(
-                        only.booked_date - timedelta(days=rule["window"]),
-                        only.booked_date + timedelta(days=rule["window"]),
-                    ),
-                    Record.amount_minor.between(
-                        only.amount_minor - rule["tolerance"],
-                        only.amount_minor + rule["tolerance"],
-                    ),
-                )
-                if rule["require_reference"]:
-                    reverse_stmt = reverse_stmt.where(Record.reference == only.reference)
-                reverse_candidates = [r for r in db.scalars(reverse_stmt.limit(30)).all()
-                                      if _available(db, r.id) and not _existing_proposal(db, r.id)]
-                if len(reverse_candidates) > 1:
-                    for r in reverse_candidates:
-                        _issue(db, r, "ambiguous", [str(x.id) for x in reverse_candidates])
+                internal, rule = next(iter(candidates.values()))
+
+                reverse = {}
+                for reverse_rule in rules_at_priority:
+                    reverse_stmt = select(Record).where(
+                        Record.period_id == period.id, Record.source_id == src_uuid,
+                        Record.kind == "external",
+                        Record.account == internal.account,
+                        Record.currency == internal.currency,
+                        Record.booked_date.between(
+                            internal.booked_date - timedelta(days=reverse_rule["window"]),
+                            internal.booked_date + timedelta(days=reverse_rule["window"])),
+                        Record.amount_minor.between(
+                            internal.amount_minor - reverse_rule["tolerance"],
+                            internal.amount_minor + reverse_rule["tolerance"]),
+                        ~claimed_query, ~pending_query,
+                    )
+                    if reverse_rule["require_reference"]:
+                        reverse_stmt = reverse_stmt.where(
+                            Record.reference == internal.reference)
+                    for possible in db.scalars(reverse_stmt.limit(11)):
+                        reverse[possible.id] = possible
+                if len(reverse) > 1:
+                    ids = [str(x) for x in reverse]
+                    for possible in reverse.values():
+                        _issue(db, possible, "ambiguous", ids)
                     stats["ambiguous"] += 1
                     ambiguous = True
                     break
-                winner = (only, rule)
+                winner = (internal, rule)
                 break
+
             if ambiguous:
                 continue
             if winner is None:
@@ -354,10 +383,14 @@ def reconcile(db, job):
                 continue
             internal, rule = winner
             group = _make_group(db, period, src_uuid, rule, [ext], [internal])
-            stats["matched" if group.state == "approved" else "proposed"] += 1
+            if group.state == "approved":
+                active.update((ext.id, internal.id))
+                stats["matched"] += 1
+            else:
+                pending.update((ext.id, internal.id))
+                stats["proposed"] += 1
     audit(db, None, "job.completed", "ReconcileJob", job.id, stats)
     return stats
-
 
 def build_report(db, period):
     rows = db.execute(select(
