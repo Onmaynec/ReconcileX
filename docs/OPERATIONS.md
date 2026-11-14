@@ -2,7 +2,7 @@
 
 Проверки: GET /health/live, GET /health/ready, docker compose ps, docker compose logs -f api worker.
 
-Для резервного копирования нужны и PostgreSQL, и MinIO. Их снимки должны соответствовать одной согласованной точке времени. Перед архивом остановите поступление новых импортов и завершите worker.
+Для резервного копирования нужны и PostgreSQL, и SILO (S3-совместимое хранилище). Их снимки должны соответствовать одной согласованной точке времени. Перед архивом остановите поступление новых импортов и завершите worker.
 
 Экспорт PostgreSQL:
 docker compose exec -T postgres pg_dump -U reconcilex -Fc reconcilex > reconcilex.backup

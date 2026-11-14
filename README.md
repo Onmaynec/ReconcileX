@@ -6,7 +6,7 @@ ReconcileX — backend для сверки банковских выписок, 
 
 ## Состав
 
-Python 3.12, FastAPI, SQLAlchemy, PostgreSQL 16, Alembic, отдельный worker, MinIO и Docker Compose. HTTP JSON API документируется автоматически: http://127.0.0.1:8000/docs и /openapi.json.
+Python 3.12, FastAPI, SQLAlchemy, PostgreSQL 16, Alembic, отдельный worker, SILO (S3-совместимое хранилище) и Docker Compose. HTTP JSON API документируется автоматически: http://127.0.0.1:8000/docs и /openapi.json.
 
 Денежные суммы хранятся только как целые minor units. Сверка возможна внутри одного счёта, валюты и периода. Автоматическая сверка 1:1 не выбирает произвольную запись при двух одинаково подходящих кандидатах. Группы 1:n и n:1 создаются вручную. Для крупных групп требуется независимый контролёр.
 
@@ -44,7 +44,7 @@ Python 3.12, FastAPI, SQLAlchemy, PostgreSQL 16, Alembic, отдельный wor
 
 Сгенерировать демонстрационные файлы без импорта: python scripts/generate_demo.py --rows 150000 --out demo-output.
 
-Загрузить все шесть форматов (150000 синтетических записей) сразу в PostgreSQL и MinIO после создания тестовых справочников:
+Загрузить все шесть форматов (150000 синтетических записей) сразу в PostgreSQL и SILO (S3-совместимое хранилище) после создания тестовых справочников:
 
 docker compose run --rm api python -m app.demo_import --rows 150000
 
