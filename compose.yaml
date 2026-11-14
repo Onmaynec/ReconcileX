@@ -1,10 +1,18 @@
+x-storage-env: &storage_env
+  S3_ENDPOINT: http://silo:9000
+  S3_BUCKET: reconcilex
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:-}
+  S3_ACCESS_KEY_FILE: ${S3_ACCESS_KEY_FILE:-}
+  S3_SECRET_KEY_FILE: ${S3_SECRET_KEY_FILE:-}
 services:
   postgres:
     image: postgres:16-alpine
     environment:
       POSTGRES_DB: reconcilex
       POSTGRES_USER: reconcilex
-      POSTGRES_PASSWORD: ${DB_PASSWORD:?set-DB_PASSWORD-in-.env}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-}
+      POSTGRES_PASSWORD_FILE: ${POSTGRES_PASSWORD_FILE:-}
     volumes: [postgres_data:/var/lib/postgresql/data]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U reconcilex -d reconcilex"]
@@ -15,8 +23,10 @@ services:
     image: docker.io/pgsty/silo:RELEASE.2026-11-12T00-00-00Z
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?set-S3_ACCESS_KEY}
-      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?set-S3_SECRET_KEY}
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-}
+      MINIO_ROOT_USER_FILE: ""
+      MINIO_ROOT_PASSWORD_FILE: ""
     volumes: [silo_data:/data]
     healthcheck:
       test: ["CMD", "silo", "healthcheck", "ready"]
@@ -25,10 +35,9 @@ services:
       retries: 20
     networks: [backend]
   init-storage:
-    image: docker.io/pgsty/mc:RELEASE.2026-11-12T00-00-00Z
-    command: ["mb", "--ignore-existing", "local/reconcilex"]
-    environment:
-      MC_HOST_local: http://${S3_ACCESS_KEY:?set-S3_ACCESS_KEY}:${S3_SECRET_KEY:?set-S3_SECRET_KEY}@silo:9000
+    build: .
+    command: ["python", "-m", "ops.init_storage"]
+    environment: *storage_env
     depends_on:
       silo: {condition: service_healthy}
     restart: on-failure:5
@@ -37,12 +46,16 @@ services:
     build: .
     command: ["alembic", "upgrade", "head"]
     environment: &app_env
-      DATABASE_URL: postgresql+psycopg://reconcilex:${DB_PASSWORD:?set-DB_PASSWORD-in-.env}@postgres:5432/reconcilex
-      JWT_SECRET: ${JWT_SECRET:?set-JWT_SECRET}
-      S3_ENDPOINT: http://silo:9000
-      S3_BUCKET: reconcilex
-      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set-S3_ACCESS_KEY}
-      S3_SECRET_KEY: ${S3_SECRET_KEY:?set-S3_SECRET_KEY}
+      DATABASE_URL: ${DATABASE_URL:-}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: reconcilex
+      DB_USER: reconcilex
+      DB_PASSWORD: ${DB_PASSWORD:-}
+      DB_PASSWORD_FILE: ""
+      JWT_SECRET: ${JWT_SECRET:-}
+      JWT_SECRET_FILE: ""
+      <<: *storage_env
       DEMO_PASSWORD: ${DEMO_PASSWORD:-}
       RISK_THRESHOLD_MINOR: ${RISK_THRESHOLD_MINOR:-10000000}
       TRUSTED_HOSTS: ${TRUSTED_HOSTS:-}
@@ -69,11 +82,10 @@ services:
       PGPORT: 5432
       PGDATABASE: reconcilex
       PGUSER: reconcilex
-      PGPASSWORD: ${DB_PASSWORD:?set-DB_PASSWORD-in-.env}
-      S3_ENDPOINT: http://silo:9000
-      S3_BUCKET: reconcilex
-      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set-S3_ACCESS_KEY}
-      S3_SECRET_KEY: ${S3_SECRET_KEY:?set-S3_SECRET_KEY}
+      PGPASSWORD: ${DB_PASSWORD:-}
+      DB_PASSWORD: ${DB_PASSWORD:-}
+      DB_PASSWORD_FILE: ""
+      <<: *storage_env
       BACKUP_ROOT: /var/backups/reconcilex
       BACKUP_KEEP: ${BACKUP_KEEP:-7}
       BACKUP_HOUR_UTC: ${BACKUP_HOUR_UTC:-3}

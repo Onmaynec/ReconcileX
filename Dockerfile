@@ -4,8 +4,10 @@ WORKDIR /service
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
+COPY ops ./ops
 COPY scripts ./scripts
 COPY migrations ./migrations
+COPY reconcilex_config.py .
 COPY alembic.ini .
 RUN useradd -u 10001 -r -m serviceuser
 USER serviceuser
