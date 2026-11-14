@@ -446,3 +446,54 @@ def test_same_priority_rules_with_different_candidates_are_ambiguous(setup):
             MatchMember.record_id.in_([
                 uuid.UUID(row["id"]) for row in records(ids, tokens, "external")
             ]), MatchMember.active.is_(True)))
+
+
+def test_wrong_currency_and_duplicates_create_auditable_exceptions(setup):
+    ids, tokens = setup
+    profile = client.post("/api/v1/profiles", headers=headers(tokens, "admin"), json={
+        "source_id": str(ids["source"]), "name": "currency-field",
+        "mapping": {"reference": "reference", "date": "date",
+                    "amount": "amount", "currency": "currency"},
+    })
+    assert profile.status_code == 201, profile.text
+    ids["currency_profile"] = uuid.UUID(profile.json()["id"])
+    bad_file = "reference,date,amount,currency\nBAD-CUR,2026-09-14,10.00,EUR\n"
+    preview = import_rows(ids, tokens, "external", bad_file,
+                          profile="currency_profile", commit=False)
+    assert preview.status_code == 200
+    assert preview.json()["errors"][0]["type"] == "wrong_currency"
+    rejected = import_rows(ids, tokens, "external", bad_file,
+                           profile="currency_profile")
+    assert rejected.status_code == 422, rejected.text
+    rejection_id = rejected.headers["X-Rejection-ID"]
+    original = client.get(f"/api/v1/imports/rejections/{rejection_id}/file",
+                          headers=headers(tokens, "auditor"))
+    assert original.status_code == 200 and original.content == bad_file.encode("utf-8")
+    first = import_rows(ids, tokens, "external", fixture_lines(
+        ("ORIGINAL", "2026-09-15", "12.00")))
+    assert first.status_code == 200, first.text
+    duplicate = import_rows(ids, tokens, "external", fixture_lines(
+        ("ORIGINAL", "2026-09-15", "12.00"),
+        ("NEW-RECORD", "2026-09-15", "10.00")))
+    assert duplicate.status_code == 409, duplicate.text
+    assert duplicate.headers["X-Rejection-ID"]
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count(Record.id)).where(
+            Record.period_id == ids["period"], Record.source_id == ids["source"])) == 1
+    issues_resp = client.get("/api/v1/issues", headers=headers(tokens),
+                             params={"source_id": str(ids["source"]),
+                                     "period_id": str(ids["period"])})
+    assert issues_resp.status_code == 200
+    issue_types = {i["issue_type"] for i in issues_resp.json()}
+    assert {"wrong_currency", "duplicate"} <= issue_types
+    duplicate_issue = next(i for i in issues_resp.json() if i["issue_type"] == "duplicate")
+    with SessionLocal() as db:
+        operator_id = db.scalar(select(User.id).where(User.username == "operator"))
+    claimed = client.post(f"/api/v1/issues/{duplicate_issue['id']}/assign",
+                          json={"owner_id": str(operator_id)}, headers=headers(tokens))
+    assert claimed.status_code == 200, claimed.text
+    resolved = client.post(f"/api/v1/issues/{duplicate_issue['id']}/resolve",
+                           json={"reason": "Исходная запись уже имеется в реестре"},
+                           headers=headers(tokens))
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["state"] == "resolved"
