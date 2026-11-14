@@ -595,3 +595,119 @@ def test_operator_cannot_read_ungranted_source(setup):
         "source_id": str(ids["source"]), "period_id": str(ids["period"])
     }, headers=auth)
     assert valid.status_code == 200, valid.text
+
+
+def test_indexed_reconciliation_bulk_pairs_and_repeat_are_idempotent(setup):
+    """Fast single-rule path must preserve every original financial invariant."""
+    from app.models import MatchGroup, ReconcileIssue
+    ids, tokens = setup
+    pairs = 620  # exercise two full write batches and a final partial one
+    rows = [(f"FAST-{i:05d}", f"2026-09-{(i % 28) + 1:02d}", "10.00")
+            for i in range(pairs)]
+    assert import_rows(ids, tokens, "external", fixture_lines(*rows)).status_code == 200
+    internal_file = "reference,date,amount,origin\n" + "".join(
+        f"{ref},{day},{amount},internal\n" for ref, day, amount in rows)
+    assert import_rows(ids, tokens, "internal", internal_file).status_code == 200
+    job = client.post(
+        "/api/v1/reconciliation/run",
+        headers=headers(tokens, key="indexed-bulk-one-00001"),
+        params={"period_id": str(ids["period"])},
+    )
+    assert job.status_code == 202, job.text
+    assert run_once()
+    with SessionLocal() as db:
+        groups = db.scalars(select(MatchGroup).where(
+            MatchGroup.period_id == ids["period"],
+            MatchGroup.source_id == ids["source"])).all()
+        assert len(groups) == pairs
+        assert all(g.state == "approved" and g.delta_minor == 0 and
+                   g.rule_version == 1 for g in groups)
+        active_members = db.scalar(select(func.count(MatchMember.id)).join(
+            MatchGroup, MatchGroup.id == MatchMember.group_id).where(
+                MatchGroup.period_id == ids["period"],
+                MatchMember.active.is_(True)))
+        assert active_members == pairs * 2
+        assert db.scalar(select(func.count(AuditEvent.id)).where(
+            AuditEvent.source_id == ids["source"],
+            AuditEvent.action == "match.confirmed")) == pairs
+        assert db.scalar(select(func.count(ReconcileIssue.id)).where(
+            ReconcileIssue.period_id == ids["period"])) == 0
+    repeat = client.post(
+        "/api/v1/reconciliation/run",
+        headers=headers(tokens, key="indexed-bulk-two-00002"),
+        params={"period_id": str(ids["period"])},
+    )
+    assert repeat.status_code == 202, repeat.text
+    assert run_once()
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count(MatchGroup.id)).where(
+            MatchGroup.period_id == ids["period"])) == pairs
+    report = client.get(
+        f"/api/v1/reports/period/{ids['period']}",
+        headers=headers(tokens, "controller"))
+    assert report.status_code == 200
+    summaries = [item for item in report.json()["by_source"]
+                 if item["source_id"] == str(ids["source"])]
+    assert len(summaries) == 1
+    assert summaries[0]["confirmed_count"] == pairs
+    assert summaries[0]["external_minor"] == pairs * 1000
+    assert summaries[0]["difference_minor"] == 0
+
+
+def test_indexed_rule_cannot_guess_reverse_ambiguous_pair(setup):
+    from app.models import MatchGroup
+    ids, tokens = setup
+    assert import_rows(ids, tokens, "external", fixture_lines(
+        ("REF-REVERSE", "2026-09-15", "10.00"),
+        ("REF-REVERSE", "2026-09-16", "10.00"))).status_code == 200
+    assert import_rows(ids, tokens, "internal", fixture_lines(
+        ("REF-REVERSE", "2026-09-15", "10.00"))).status_code == 200
+    submitted = client.post(
+        "/api/v1/reconciliation/run",
+        headers=headers(tokens, key="indexed-reverse-ambiguity-01"),
+        params={"period_id": str(ids["period"])},
+    )
+    assert submitted.status_code == 202
+    assert run_once()
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count(MatchGroup.id)).where(
+            MatchGroup.period_id == ids["period"])) == 0
+    issues = client.get("/api/v1/issues", headers=headers(tokens),
+                        params={"source_id": str(ids["source"]),
+                                "period_id": str(ids["period"])})
+    assert issues.status_code == 200
+    ambiguous = [i for i in issues.json() if i["issue_type"] == "ambiguous"]
+    assert len(ambiguous) == 2
+    assert all(len(i["candidates"]) == 2 for i in ambiguous)
+
+
+def test_indexed_rule_high_risk_keeps_four_eyes_proposal(setup):
+    from app.models import MatchGroup
+    ids, tokens = setup
+    assert import_rows(ids, tokens, "external", fixture_lines(
+        ("HIGH-INDEXED", "2026-09-15", "1500.00"))).status_code == 200
+    assert import_rows(ids, tokens, "internal",
+                       "reference,date,amount,origin\nHIGH-INDEXED,2026-09-15,1500.00,internal\n").status_code == 200
+    submitted = client.post(
+        "/api/v1/reconciliation/run",
+        headers=headers(tokens, key="indexed-four-eyes-0001"),
+        params={"period_id": str(ids["period"])},
+    )
+    assert submitted.status_code == 202
+    assert run_once()
+    with SessionLocal() as db:
+        group = db.scalar(select(MatchGroup).where(
+            MatchGroup.period_id == ids["period"]))
+        assert group and group.state == "proposed" and group.version == 1
+        group_id = group.id
+        assert db.scalar(select(func.count(MatchMember.id)).where(
+            MatchMember.group_id == group_id, MatchMember.active.is_(True))) == 0
+    denied = client.post(
+        f"/api/v1/match-groups/{group_id}/approve",
+        json={"expected_version": 1}, headers=headers(tokens))
+    assert denied.status_code == 403
+    accepted = client.post(
+        f"/api/v1/match-groups/{group_id}/approve",
+        json={"expected_version": 1}, headers=headers(tokens, "controller"))
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["state"] == "approved"

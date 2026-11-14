@@ -1,0 +1,78 @@
+name: Full Reconciliation Benchmark
+on:
+  workflow_dispatch:
+    inputs:
+      pairs:
+        description: Number of matched 1:1 transaction pairs
+        required: true
+        type: number
+        default: 80000
+      internal_extra:
+        description: Unmatched internal records
+        required: true
+        type: number
+        default: 20000
+      external_extra:
+        description: Unmatched external records
+        required: true
+        type: number
+        default: 0
+      runs:
+        description: Independent full runs for percentile estimates
+        required: true
+        type: number
+        default: 1
+permissions:
+  contents: read
+jobs:
+  full-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: reconcilex_test
+          POSTGRES_USER: reconcilex
+          POSTGRES_PASSWORD: test-only-password
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U reconcilex -d reconcilex_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      DATABASE_URL: postgresql+psycopg://reconcilex:test-only-password@localhost:5432/reconcilex_test
+      JWT_SECRET: test-only-secret-with-32-or-more-characters-123456789
+      DEMO_PASSWORD: demo-test-password
+      STORAGE_MODE: local
+      LOCAL_STORAGE_DIR: /tmp/reconcilex-benchmark-originals
+      RISK_THRESHOLD_MINOR: 50000
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: alembic upgrade head
+      - run: python -m app.seed
+      - name: Reconcile exact 1:1 pairs from synthetic HTTP imports
+        env:
+          PAIRS: ${{ inputs.pairs }}
+          EXTRA_INTERNAL: ${{ inputs.internal_extra }}
+          EXTRA_EXTERNAL: ${{ inputs.external_extra }}
+          RUNS: ${{ inputs.runs }}
+        run: |
+          python -m scripts.e2e_benchmark \
+            --pairs "$PAIRS" \
+            --internal-extra "$EXTRA_INTERNAL" \
+            --external-extra "$EXTRA_EXTERNAL" \
+            --runs "$RUNS" \
+            --output /tmp/reconcilex-full-e2e.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reconcilex-full-e2e-report
+          path: /tmp/reconcilex-full-e2e.json
+          retention-days: 14
+          if-no-files-found: warn
