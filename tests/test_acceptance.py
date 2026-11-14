@@ -889,7 +889,8 @@ def test_v070_multiple_priorities_bulk_are_indexed_and_financially_exact(setup):
     record_queries = []
 
     def count_record_queries(conn, cursor, statement, params, context, executemany):
-        if statement.lstrip().lower().startswith("select") and "records" in statement.lower():
+        query = statement.lstrip().lower()
+        if query.startswith("select") and "from records" in query and " between " in query:
             record_queries.append(statement)
 
     event.listen(engine, "before_cursor_execute", count_record_queries)
@@ -897,7 +898,7 @@ def test_v070_multiple_priorities_bulk_are_indexed_and_financially_exact(setup):
         assert run_once()
     finally:
         event.remove(engine, "before_cursor_execute", count_record_queries)
-    assert len(record_queries) <= 8, len(record_queries)
+    assert not record_queries, record_queries[:2]
 
     with SessionLocal() as db:
         groups = db.scalars(select(MatchGroup).where(
@@ -945,8 +946,9 @@ def test_v070_same_priority_multiple_rules_one_candidate_is_not_ambiguous(setup)
     assert response.status_code == 201, response.text
     assert import_rows(ids, tokens, "external", fixture_lines(
         ("IDENTICAL", "2026-09-12", "18.01"))).status_code == 200
-    assert import_rows(ids, tokens, "internal", fixture_lines(
-        ("IDENTICAL", "2026-09-12", "18.01"))).status_code == 200
+    assert import_rows(ids, tokens, "internal",
+                       "reference,date,amount,origin\n"
+                       "IDENTICAL,2026-09-12,18.01,internal\n").status_code == 200
     job = client.post("/api/v1/reconciliation/run",
                       headers=headers(tokens, key="multi-same-one-00700001"),
                       params={"period_id": str(ids["period"])})
