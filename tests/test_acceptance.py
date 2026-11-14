@@ -1039,3 +1039,43 @@ def test_v070_broad_rule_keeps_tolerance_date_and_high_risk_controls(setup):
                             headers=headers(tokens, "controller"),
                             json={"expected_version": 1})
     assert confirmed.status_code == 200
+
+
+
+def test_v070_capped_reverse_candidates_mark_all_ambiguous_external_rows(setup):
+    """A reverse scan capped at 11 must not hide the 12th/15th external issue."""
+    from app.models import MatchGroup, ReconcileIssue
+
+    ids, tokens = setup
+    with SessionLocal.begin() as db:
+        db.get(MatchRule, ids["rule"]).current = False
+    response = client.post("/api/v1/rules",
+                           headers=headers(tokens, "admin"), json={
+        "source_id": str(ids["source"]), "rule_key": "broad-cap",
+        "priority": 80, "day_window": 2, "tolerance_minor": 0,
+        "require_reference": False,
+    })
+    assert response.status_code == 201, response.text
+    references = [f"CAP-EXT-{i:02d}" for i in range(15)]
+    assert import_rows(ids, tokens, "external", fixture_lines(*[
+        (ref, "2026-09-12", "21.02") for ref in references
+    ])).status_code == 200
+    assert import_rows(ids, tokens, "internal", fixture_lines(
+        ("CAP-INTERNAL", "2026-09-12", "21.02"))).status_code == 200
+    submitted = client.post("/api/v1/reconciliation/run",
+                            headers=headers(tokens, key="broad-overcap-00700001"),
+                            params={"period_id": str(ids["period"])})
+    assert submitted.status_code == 202
+    assert run_once()
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count(MatchGroup.id)).where(
+            MatchGroup.period_id == ids["period"])) == 0
+        issues = db.scalars(select(ReconcileIssue).where(
+            ReconcileIssue.period_id == ids["period"],
+            ReconcileIssue.issue_type == "ambiguous")).all()
+        assert len(issues) == 15
+        issue_ids = {issue.record_id for issue in issues}
+        externals = db.scalars(select(Record.id).where(
+            Record.period_id == ids["period"],
+            Record.kind == "external")).all()
+        assert issue_ids == set(externals)
