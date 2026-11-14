@@ -605,7 +605,9 @@ def test_indexed_reconciliation_bulk_pairs_and_repeat_are_idempotent(setup):
     rows = [(f"FAST-{i:05d}", f"2026-09-{(i % 28) + 1:02d}", "10.00")
             for i in range(pairs)]
     assert import_rows(ids, tokens, "external", fixture_lines(*rows)).status_code == 200
-    assert import_rows(ids, tokens, "internal", fixture_lines(*rows)).status_code == 200
+    internal_file = "reference,date,amount,origin\n" + "".join(
+        f"{ref},{day},{amount},internal\n" for ref, day, amount in rows)
+    assert import_rows(ids, tokens, "internal", internal_file).status_code == 200
     job = client.post(
         "/api/v1/reconciliation/run",
         headers=headers(tokens, key="indexed-bulk-one-00001"),
@@ -681,8 +683,8 @@ def test_indexed_rule_high_risk_keeps_four_eyes_proposal(setup):
     ids, tokens = setup
     assert import_rows(ids, tokens, "external", fixture_lines(
         ("HIGH-INDEXED", "2026-09-15", "1500.00"))).status_code == 200
-    assert import_rows(ids, tokens, "internal", fixture_lines(
-        ("HIGH-INDEXED", "2026-09-15", "1500.00"))).status_code == 200
+    assert import_rows(ids, tokens, "internal",
+                       "reference,date,amount,origin\nHIGH-INDEXED,2026-09-15,1500.00,internal\n").status_code == 200
     submitted = client.post(
         "/api/v1/reconciliation/run",
         headers=headers(tokens, key="indexed-four-eyes-0001"),
