@@ -25,8 +25,10 @@ def put_original(key, data):
         path.write_bytes(data)
         return
     client = _client()
-    client.put_object(Bucket=os.environ["S3_BUCKET"], Key=key, Body=data,
-                      ServerSideEncryption="AES256")
+    extra = {}
+    if os.getenv("S3_SSE") == "AES256":
+        extra["ServerSideEncryption"] = "AES256"
+    client.put_object(Bucket=os.environ["S3_BUCKET"], Key=key, Body=data, **extra)
 
 
 def get_original(key):

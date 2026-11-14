@@ -146,6 +146,7 @@ class MatchGroup(Base):
     proposed_by = Column(Uuid(as_uuid=True), ForeignKey("users.id"), nullable=True)
     approved_by = Column(Uuid(as_uuid=True), ForeignKey("users.id"), nullable=True)
     comment = Column(Text, nullable=True)
+    request_key = Column(String(120), nullable=True)
     explanation = Column(JSON, nullable=False)
     external_minor = Column(BigInteger, nullable=False)
     internal_minor = Column(BigInteger, nullable=False)
@@ -154,6 +155,7 @@ class MatchGroup(Base):
     approved_at = Column(DateTime(timezone=True), nullable=True)
     version = Column(Integer, nullable=False, default=1)
     members = relationship("MatchMember", cascade="all, delete-orphan")
+    __table_args__ = (UniqueConstraint("period_id", "request_key", name="uq_match_request"),)
 
 
 class MatchMember(Base):
