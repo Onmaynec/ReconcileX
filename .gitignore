@@ -1,0 +1,12 @@
+.env
+*.pyc
+__pycache__/
+.pytest_cache/
+.venv/
+.coverage
+dist/
+build/
+*.egg-info/
+*.db
+*.sqlite3
+demo-output/
