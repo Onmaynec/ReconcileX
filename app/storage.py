@@ -3,17 +3,15 @@ import os
 from pathlib import Path
 import boto3
 from botocore.client import Config
-
+from reconcilex_config import secret_value
 
 def _client():
     return boto3.client(
         "s3", endpoint_url=os.environ["S3_ENDPOINT"],
-        aws_access_key_id=os.environ["S3_ACCESS_KEY"],
-        aws_secret_access_key=os.environ["S3_SECRET_KEY"],
-        region_name="us-east-1",
-        config=Config(signature_version="s3v4"),
+        aws_access_key_id=secret_value("S3_ACCESS_KEY", required=True),
+        aws_secret_access_key=secret_value("S3_SECRET_KEY", required=True),
+        region_name="us-east-1", config=Config(signature_version="s3v4"),
     )
-
 
 def put_original(key, data):
     if os.getenv("STORAGE_MODE") == "local":
@@ -25,11 +23,8 @@ def put_original(key, data):
         path.write_bytes(data)
         return
     client = _client()
-    extra = {}
-    if os.getenv("S3_SSE") == "AES256":
-        extra["ServerSideEncryption"] = "AES256"
+    extra = {"ServerSideEncryption": "AES256"} if os.getenv("S3_SSE") == "AES256" else {}
     client.put_object(Bucket=os.environ["S3_BUCKET"], Key=key, Body=data, **extra)
-
 
 def get_original(key):
     if os.getenv("STORAGE_MODE") == "local":
