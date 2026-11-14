@@ -247,6 +247,17 @@ def change_own_password(body: PasswordChangeBody,
         return {"changed": True, "sessions_revoked": True}
 
 
+@app.post("/api/v1/auth/logout-all")
+def logout_all_sessions(user=Depends(current_user), db=Depends(get_db)):
+    with transaction(db):
+        account = db.scalar(select(User).where(User.id == user.id).with_for_update())
+        if not account or not account.enabled:
+            raise HTTPException(401, "Account disabled")
+        account.token_epoch += 1
+        audit(db, account, "user.sessions_revoked", "User", account.id)
+        return {"sessions_revoked": True}
+
+
 class SourceBody(BaseModel):
     name: str = Field(min_length=2, max_length=160)
     account: str = Field(min_length=1, max_length=64)
@@ -272,6 +283,19 @@ def list_sources(user=Depends(current_user), db=Depends(get_db)):
             SourceGrant.user_id == user.id)
     return [{"id": str(s.id), "name": s.name, "account": s.account, "currency": s.currency}
             for s in db.scalars(stmt)]
+
+
+@app.get("/api/v1/admin/users")
+def admin_list_users(limit: int = 100, offset: int = 0,
+                     user=Depends(current_user), db=Depends(get_db)):
+    require_role(user, "admin")
+    if not 1 <= limit <= 200 or offset < 0:
+        raise HTTPException(400, "Invalid pagination")
+    found = db.scalars(select(User).order_by(User.username, User.id)
+                       .limit(limit).offset(offset)).all()
+    return [{"id": str(account.id), "username": account.username,
+             "role": account.role, "enabled": account.enabled}
+            for account in found]
 
 
 class UserBody(BaseModel):
@@ -398,6 +422,17 @@ def revoke_source_access(body: GrantBody, user=Depends(current_user),
         audit(db, user, "source.revoked", "SourceGrant", grant.id,
               {"user_id": str(body.user_id)}, body.source_id)
         return {"revoked": True}
+
+
+@app.get("/api/v1/admin/grants")
+def admin_list_grants(user_id: UUID, user=Depends(current_user),
+                      db=Depends(get_db)):
+    require_role(user, "admin")
+    if not db.get(User, user_id):
+        raise HTTPException(404, "User not found")
+    return [{"id": str(grant.id), "source_id": str(grant.source_id)}
+            for grant in db.scalars(select(SourceGrant).where(
+                SourceGrant.user_id == user_id).order_by(SourceGrant.source_id))]
 
 
 class ProfileBody(BaseModel):
