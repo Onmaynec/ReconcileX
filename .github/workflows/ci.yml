@@ -47,6 +47,13 @@ jobs:
           name: reconcilex-perf-synthetic
           path: /tmp/reconcilex-perf.json
           retention-days: 14
+      - name: HTTP-to-worker reconciliation performance acceptance
+        run: python -m scripts.e2e_benchmark --pairs 300 --internal-extra 80 --external-extra 20 --output /tmp/reconcilex-e2e.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reconcilex-e2e-synthetic
+          path: /tmp/reconcilex-e2e.json
+          retention-days: 14
       - run: python -c "from app.api import app; assert '/api/v1/imports/commit' in app.openapi()['paths']"
       - name: HTTP application startup
         run: |
