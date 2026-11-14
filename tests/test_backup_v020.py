@@ -46,7 +46,7 @@ def test_backup_manifest_rejects_tampered_dump_and_object(monkeypatch, tmp_path)
     with pytest.raises(RuntimeError, match="truncated"):
         backup.validate_snapshot(snapshot)
     target.write_bytes(payload)
-    dump.write_bytes(b"modified dump content!")
+    dump.write_bytes(b"X" + dump.read_bytes()[1:])
     with pytest.raises(RuntimeError, match="checksum"):
         backup.validate_snapshot(snapshot)
 
