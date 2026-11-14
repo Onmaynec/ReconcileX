@@ -86,6 +86,7 @@ def isolated(monkeypatch, tmp_path):
         "OFFSITE_S3_REGION": "us-east-1",
         "OFFSITE_S3_ENCRYPTION": "AES256",
         "S3_ENDPOINT": "http://silo:9000",
+        "S3_BUCKET": "reconcilex",
         "S3_ACCESS_KEY": "application-access",
         "S3_SECRET_KEY": "application-secret",
     }.items():
