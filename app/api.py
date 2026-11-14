@@ -66,7 +66,11 @@ def error_body(status, message, details=None):
 
 @app.exception_handler(HTTPException)
 async def http_error(request, exc):
-    return JSONResponse(status_code=exc.status_code, content=error_body(exc.status_code, exc.detail))
+    detail = exc.detail
+    if isinstance(detail, dict):
+        return JSONResponse(status_code=exc.status_code, content=error_body(
+            exc.status_code, detail.get("reason", "Request rejected"), detail.get("errors", [])))
+    return JSONResponse(status_code=exc.status_code, content=error_body(exc.status_code, detail))
 
 
 @app.exception_handler(RequestValidationError)
