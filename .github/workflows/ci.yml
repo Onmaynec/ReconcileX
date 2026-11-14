@@ -59,7 +59,7 @@ jobs:
           JWT_SECRET: test-only-secret-with-32-or-more-characters-123456789
 
       - name: Build runtime image
-        run: docker compose build api worker
+        run: docker compose build api worker backup
         env:
           DB_PASSWORD: local-ci-database-password
           S3_ACCESS_KEY: reconcilex-local
@@ -73,6 +73,9 @@ jobs:
           docker compose run --rm api python -m app.seed
           docker compose run --rm api python -m app.demo_import --rows 120
           docker compose run --rm api python -m app.demo_import --rows 120
+          docker compose run --rm backup once
+          docker compose run --rm backup verify
+          docker compose run --rm backup restore-check
         env:
           DB_PASSWORD: local-ci-database-password
           S3_ACCESS_KEY: reconcilex-local
