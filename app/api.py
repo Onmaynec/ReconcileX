@@ -1,6 +1,7 @@
 """Versioned HTTP API. All financial state changes execute in database transactions."""
 import csv
 import io
+from contextlib import contextmanager
 import logging
 import os
 import uuid
@@ -32,6 +33,16 @@ from app.service import (
     create_manual_group, current_rules, locked_period, reopen_period, submit_job,
 )
 from app.storage import get_original, put_original
+
+@contextmanager
+def transaction(db):
+    try:
+        yield
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
 
 app = FastAPI(
     title="ReconcileX API", version="0.1.0",
@@ -153,7 +164,7 @@ class SourceBody(BaseModel):
 @app.post("/api/v1/sources", status_code=201)
 def create_source(body: SourceBody, user=Depends(current_user), db=Depends(get_db)):
     require_role(user, "admin")
-    with db.begin():
+    with transaction(db):
         source = Source(**body.model_dump())
         db.add(source)
         db.flush()
@@ -187,7 +198,7 @@ class UserBody(BaseModel):
 @app.post("/api/v1/admin/users", status_code=201)
 def create_user(body: UserBody, user=Depends(current_user), db=Depends(get_db)):
     require_role(user, "admin")
-    with db.begin():
+    with transaction(db):
         new = User(username=body.username, password_hash=hash_password(body.password), role=body.role)
         db.add(new)
         db.flush()
@@ -203,7 +214,7 @@ class GrantBody(BaseModel):
 @app.post("/api/v1/admin/grants", status_code=201)
 def grant_source(body: GrantBody, user=Depends(current_user), db=Depends(get_db)):
     require_role(user, "admin")
-    with db.begin():
+    with transaction(db):
         if not db.get(User, body.user_id) or not db.get(Source, body.source_id):
             raise HTTPException(404, "User or source not found")
         existing = db.scalar(select(SourceGrant).where(
@@ -238,7 +249,7 @@ class ProfileBody(BaseModel):
 @app.post("/api/v1/profiles", status_code=201)
 def create_profile(body: ProfileBody, user=Depends(current_user), db=Depends(get_db)):
     require_role(user, "admin")
-    with db.begin():
+    with transaction(db):
         if not db.get(Source, body.source_id):
             raise HTTPException(404, "Source not found")
         previous = db.scalar(select(func.max(ImportProfile.version)).where(
@@ -273,7 +284,7 @@ def create_period(body: PeriodBody, user=Depends(current_user), db=Depends(get_d
     require_role(user, "admin")
     if body.end_date < body.start_date:
         raise HTTPException(400, "Invalid date range")
-    with db.begin():
+    with transaction(db):
         if db.scalar(select(Period.id).where(
             Period.start_date <= body.end_date, Period.end_date >= body.start_date)):
             raise HTTPException(409, "Period overlaps an existing period")
@@ -303,7 +314,7 @@ class RuleBody(BaseModel):
 @app.post("/api/v1/rules", status_code=201)
 def add_rule(body: RuleBody, user=Depends(current_user), db=Depends(get_db)):
     require_role(user, "admin")
-    with db.begin():
+    with transaction(db):
         if not db.get(Source, body.source_id):
             raise HTTPException(404, "Source not found")
         previous = db.scalars(select(MatchRule).where(
@@ -389,7 +400,7 @@ async def import_commit(
             "reason": "Atomic import rejected: invalid rows",
             "errors": result["errors"],
         })
-    with db.begin():
+    with transaction(db):
         locked_period(db, period_id)
         previous = db.scalar(select(ImportBatch).where(
             ImportBatch.source_id == source_id, ImportBatch.file_sha256 == result["sha256"]))
@@ -473,7 +484,7 @@ def start_reconciliation(
     period_id: UUID, key: str | None = Header(default=None, alias="Idempotency-Key"),
     user=Depends(current_user), db=Depends(get_db),
 ):
-    with db.begin():
+    with transaction(db):
         job, created = submit_job(db, period_id, key or "", user)
         return {"id": str(job.id), "state": job.state, "created": created,
                 "rules_snapshot": job.rules_snapshot}
@@ -523,7 +534,7 @@ def propose_match(
     body: GroupBody, key: str | None = Header(default=None, alias="Idempotency-Key"),
     user=Depends(current_user), db=Depends(get_db),
 ):
-    with db.begin():
+    with transaction(db):
         group = create_manual_group(
             db, body.period_id, body.source_id, body.external_ids,
             body.internal_ids, body.rule_id, user, body.comment, key,
@@ -538,7 +549,7 @@ class DecisionBody(BaseModel):
 @app.post("/api/v1/match-groups/{group_id}/approve")
 def approve(group_id: UUID, body: DecisionBody,
             user=Depends(current_user), db=Depends(get_db)):
-    with db.begin():
+    with transaction(db):
         return group_info(approve_group(db, group_id, user, body.expected_version))
 
 
@@ -549,7 +560,7 @@ class CancelBody(DecisionBody):
 @app.post("/api/v1/match-groups/{group_id}/cancel")
 def cancel(group_id: UUID, body: CancelBody,
            user=Depends(current_user), db=Depends(get_db)):
-    with db.begin():
+    with transaction(db):
         return group_info(cancel_group(db, group_id, user, body.reason, body.expected_version))
 
 
@@ -569,7 +580,7 @@ def get_match(group_id: UUID, user=Depends(current_user), db=Depends(get_db)):
 
 @app.post("/api/v1/periods/{period_id}/close")
 def close(period_id: UUID, user=Depends(current_user), db=Depends(get_db)):
-    with db.begin():
+    with transaction(db):
         # A controller cannot close a period containing sources outside their grants.
         sources = db.scalars(select(ImportBatch.source_id).where(
             ImportBatch.period_id == period_id).distinct()).all()
@@ -586,7 +597,7 @@ class ReasonBody(BaseModel):
 
 @app.post("/api/v1/periods/{period_id}/reopen")
 def reopen(period_id: UUID, body: ReasonBody, user=Depends(current_user), db=Depends(get_db)):
-    with db.begin():
+    with transaction(db):
         period = reopen_period(db, period_id, user, body.reason)
         return {"id": str(period.id), "status": period.status, "version": period.version}
 
