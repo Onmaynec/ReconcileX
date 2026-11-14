@@ -76,7 +76,7 @@ def transaction(db):
 
 
 app = FastAPI(
-    title="ReconcileX API", version="0.4.0",
+    title="ReconcileX API", version="0.8.0",
     description="Auditable reconciliation for synthetic bank statements and internal ledgers.",
 )
 log = configure_logging()
