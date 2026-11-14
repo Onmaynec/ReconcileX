@@ -46,6 +46,7 @@ services:
       DEMO_PASSWORD: ${DEMO_PASSWORD:-}
       RISK_THRESHOLD_MINOR: ${RISK_THRESHOLD_MINOR:-10000000}
       TRUSTED_HOSTS: ${TRUSTED_HOSTS:-}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.29.240.10/32}
     depends_on:
       postgres: {condition: service_healthy}
     networks: [backend]
@@ -103,3 +104,6 @@ volumes:
   backup_data:
 networks:
   backend:
+    ipam:
+      config:
+        - subnet: ${BACKEND_SUBNET:-172.29.240.0/24}

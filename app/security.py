@@ -1,3 +1,4 @@
+import ipaddress
 import os
 from datetime import datetime, timedelta, timezone
 import jwt
@@ -36,6 +37,46 @@ def token_for(user):
         "exp": datetime.now(timezone.utc) + timedelta(hours=8),
     }
     return jwt.encode(payload, secret, algorithm="HS256")
+
+
+
+def trusted_client_ip(request, trusted_proxy_cidrs=None):
+    """Return the peer IP unless the peer is an explicitly trusted proxy.
+
+    X-Real-IP is accepted only from the static reverse-proxy address configured
+    by the deployment. Direct clients cannot override their rate-limit identity
+    by supplying a forwarded header.
+    """
+    peer = request.client.host if request.client else "unknown"
+    raw = (os.getenv("TRUSTED_PROXY_CIDRS", "")
+           if trusted_proxy_cidrs is None else trusted_proxy_cidrs)
+    if not raw.strip():
+        return peer
+
+    try:
+        networks = [
+            ipaddress.ip_network(item.strip(), strict=False)
+            for item in raw.split(",") if item.strip()
+        ]
+    except ValueError as exc:
+        raise RuntimeError("TRUSTED_PROXY_CIDRS contains an invalid network") from exc
+    if not networks:
+        return peer
+
+    try:
+        peer_address = ipaddress.ip_address(peer)
+    except ValueError:
+        return peer
+    if not any(peer_address in network for network in networks):
+        return peer
+
+    forwarded = request.headers.get("X-Real-IP", "").strip()
+    if not forwarded:
+        return peer
+    try:
+        return str(ipaddress.ip_address(forwarded))
+    except ValueError:
+        return peer
 
 
 def current_user(
