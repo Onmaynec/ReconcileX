@@ -497,3 +497,60 @@ def test_wrong_currency_and_duplicates_create_auditable_exceptions(setup):
                            headers=headers(tokens))
     assert resolved.status_code == 200, resolved.text
     assert resolved.json()["state"] == "resolved"
+
+
+def test_at07_self_approval_denied_even_after_role_change(setup):
+    from app.models import SourceGrant
+    from app.security import hash_password, token_for
+
+    ids, tokens = setup
+    assert import_rows(ids, tokens, "external", fixture_lines(
+        ("SELF", "2026-09-16", "2200.00"))).status_code == 200
+    assert import_rows(ids, tokens, "internal", fixture_lines(
+        ("SELF", "2026-09-17", "2200.00"))).status_code == 200
+    external_id = records(ids, tokens, "external")[0]["id"]
+    internal_id = records(ids, tokens, "internal")[0]["id"]
+
+    with SessionLocal.begin() as db:
+        author = User(
+            username="role-change-" + uuid.uuid4().hex[:10],
+            role="operator", password_hash=hash_password("synthetic-password-123"))
+        db.add(author)
+        db.flush()
+        db.add(SourceGrant(source_id=ids["source"], user_id=author.id))
+        author_id = author.id
+        author_token = token_for(author)
+    proposed = client.post("/api/v1/match-groups",
+                           headers={"Authorization": "Bearer " + author_token,
+                                    "Idempotency-Key": "self-approval-check-0001"},
+                           json={"period_id": str(ids["period"]),
+                                 "source_id": str(ids["source"]),
+                                 "rule_id": str(ids["rule"]),
+                                 "external_ids": [external_id],
+                                 "internal_ids": [internal_id],
+                                 "comment": "Проверка самосогласования после смены роли"})
+    assert proposed.status_code == 201, proposed.text
+    assert proposed.json()["state"] == "proposed"
+    with SessionLocal.begin() as db:
+        account = db.get(User, author_id)
+        account.role = "controller"
+    refused = client.post(f"/api/v1/match-groups/{proposed.json()['id']}/approve",
+                          headers={"Authorization": "Bearer " + author_token},
+                          json={"expected_version": 1})
+    assert refused.status_code == 403, refused.text
+    assert "Self-approval" in refused.json()["message"]
+
+
+def test_period_close_rejects_incomplete_jobs(setup):
+    ids, tokens = setup
+    submitted = client.post("/api/v1/reconciliation/run",
+                            headers=headers(tokens, key="unsettled-close-check-01"),
+                            params={"period_id": str(ids["period"])})
+    assert submitted.status_code == 202
+    refused = client.post(f"/api/v1/periods/{ids['period']}/close",
+                          headers=headers(tokens, "controller"))
+    assert refused.status_code == 409
+    assert run_once()
+    accepted = client.post(f"/api/v1/periods/{ids['period']}/close",
+                           headers=headers(tokens, "controller"))
+    assert accepted.status_code == 200, accepted.text
