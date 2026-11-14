@@ -1,4 +1,4 @@
-"""ReconcileX v0.2: consistent PostgreSQL-first, S3-second backup and restore verification.
+"""ReconcileX: consistent PostgreSQL, originals and optional off-site replication.
 
 The source originals are content-addressed and never deleted by ReconcileX:
 copying objects *after* pg_dump ensures that records present in the dump have
@@ -21,6 +21,8 @@ from pathlib import Path
 
 import boto3
 from botocore.config import Config
+
+from ops import offsite
 
 KEY_PATTERN = re.compile(
     r"^(?:originals|rejected)/[0-9a-f-]{36}/[0-9a-f]{64}$")
@@ -150,7 +152,12 @@ def backup_once(keep):
             write_json(staging / "manifest.json", manifest)
             validate_snapshot(staging, require_final=False)
             staging.rename(final)
-            # Retention is applied ONLY after complete, verified snapshot publication.
+            # Upload and read back every completed copy before local rotation.
+            # If replication fails, this final local snapshot and all older
+            # snapshots are retained. Re-run "offsite-sync" after fixing access.
+            if offsite.configured():
+                replicate_all()
+            # Retention is applied ONLY after complete, verified publication.
             previous = snapshots()
             for outdated in previous[:-keep]:
                 shutil.rmtree(outdated)
@@ -251,6 +258,58 @@ def restore_check(path):
             run(["dropdb", "--if-exists", "--force", temporary])
 
 
+def replicate_all():
+    """Publish every completed snapshot; supports retry after network outages."""
+    config = offsite.settings()
+    client = offsite.client_for(config)
+    names = []
+    for snapshot in snapshots():
+        manifest = validate_snapshot(snapshot)
+        offsite.upload_snapshot(snapshot, manifest, client=client, config=config)
+        names.append(snapshot.name)
+    return names
+
+
+def sync_offsite():
+    BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+    with (BACKUP_ROOT / ".backup.lock").open("a+b") as guard:
+        fcntl.flock(guard.fileno(), fcntl.LOCK_EX)
+        names = replicate_all()
+    print(json.dumps({"event": "offsite_synced", "snapshots": len(names)}), flush=True)
+
+
+def verify_offsite(name=None):
+    config = offsite.settings()
+    client = offsite.client_for(config)
+    target_name = name or offsite.latest_snapshot_name(client=client, config=config)
+    manifest = offsite.verify_snapshot(
+        target_name, client=client, config=config, full=True,
+    )
+    print(json.dumps({"event": "offsite_verified", "snapshot": target_name,
+                      "object_count": len(manifest["objects"])}), flush=True)
+
+
+def drill_offsite(name=None):
+    """Read remote archive into a new private folder, restore to TEMP DB, remove."""
+    config = offsite.settings()
+    client = offsite.client_for(config)
+    target_name = name or offsite.latest_snapshot_name(client=client, config=config)
+    BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+    temporary_name = utcnow().strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+    temporary = BACKUP_ROOT / temporary_name
+    # The path must not already exist: off-site restore never overwrites data.
+    try:
+        offsite.download_snapshot(
+            target_name, temporary, client=client, config=config,
+        )
+        restore_check(temporary)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    print(json.dumps({"event": "offsite_drill_verified",
+                      "snapshot": target_name}), flush=True)
+
+
 def status(max_age_hours):
     """Lightweight service health: a recent completed backup must exist."""
     if max_age_hours <= 0:
@@ -265,9 +324,13 @@ def status(max_age_hours):
     age_hours = (utcnow() - created).total_seconds() / 3600
     if not 0 <= age_hours <= max_age_hours:
         raise RuntimeError(f"Last successful backup is stale ({age_hours:.2f}h)")
-    print(json.dumps({"event": "backup_healthy",
-                      "age_hours": round(age_hours, 3),
-                      "last_snapshot": latest.name}), flush=True)
+    result = {"event": "backup_healthy",
+              "age_hours": round(age_hours, 3),
+              "last_snapshot": latest.name}
+    if offsite.configured():
+        result["offsite"] = offsite.check_recent(
+            latest, float(os.getenv("OFFSITE_MAX_AGE_HOURS", str(max_age_hours))))
+    print(json.dumps(result), flush=True)
 
 
 def schedule():
@@ -291,8 +354,11 @@ def schedule():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("once", "verify", "restore-check", "status", "schedule"))
+    parser.add_argument("command", choices=(
+        "once", "verify", "restore-check", "status", "schedule",
+        "offsite-sync", "offsite-verify", "offsite-drill"))
     parser.add_argument("--snapshot", type=Path)
+    parser.add_argument("--remote-snapshot", type=str)
     parser.add_argument("--keep", type=int, default=int(os.getenv("BACKUP_KEEP", "7")))
     parser.add_argument("--max-age-hours", type=float, default=36)
     args = parser.parse_args()
@@ -303,6 +369,12 @@ def main():
             schedule()
         elif args.command == "status":
             status(args.max_age_hours)
+        elif args.command == "offsite-sync":
+            sync_offsite()
+        elif args.command == "offsite-verify":
+            verify_offsite(args.remote_snapshot)
+        elif args.command == "offsite-drill":
+            drill_offsite(args.remote_snapshot)
         else:
             target = args.snapshot.resolve() if args.snapshot else (snapshots()[-1] if snapshots() else None)
             if target is None:
