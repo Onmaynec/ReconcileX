@@ -23,7 +23,8 @@ from sqlalchemy.exc import IntegrityError
 from app.db import SessionLocal, get_db
 from app.importer import MAX_BYTES, inspect_file
 from app.models import (
-    AuditEvent, AuthAttempt, ImportBatch, ImportProfile, MatchGroup, MatchMember, PeriodSnapshot,
+    AuditEvent, AuthAttempt, ImportBatch, ImportProfile, ImportRejection,
+    IssueAssignment, MatchGroup, MatchMember, PeriodSnapshot,
     MatchRule, Period, Record, ReconcileIssue, ReconcileJob, Source,
     SourceGrant, User,
 )
@@ -392,6 +393,44 @@ def inspect_or_error(data, filename, profile, source, kind, period):
         raise HTTPException(422, f"Invalid input file: {exc}")
 
 
+def retain_rejected_import(db, source_id, period_id, profile_id, user, data, result, errors):
+    """Persist diagnostic originals, but never post financial Record rows."""
+    old = db.scalar(select(ImportRejection).where(
+        ImportRejection.source_id == source_id,
+        ImportRejection.file_sha256 == result["sha256"]))
+    if old:
+        return old
+    object_key = f"rejected/{source_id}/{result['sha256']}"
+    put_original(object_key, data)
+    rejected = ImportRejection(
+        source_id=source_id, period_id=period_id, profile_id=profile_id,
+        file_sha256=result["sha256"], object_key=object_key,
+        filename=result["filename"], errors=errors, created_by=user.id,
+    )
+    db.add(rejected)
+    db.flush()
+    for error in errors:
+        existing_record = error.get("record_id")
+        record_id = UUID(existing_record) if existing_record else None
+        issue_type = error.get("type", "validation_error")
+        if record_id and db.scalar(select(ReconcileIssue.id).where(
+            ReconcileIssue.period_id == period_id,
+            ReconcileIssue.record_id == record_id,
+            ReconcileIssue.issue_type == issue_type)):
+            continue
+        db.add(ReconcileIssue(
+            period_id=period_id, source_id=source_id, record_id=record_id,
+            issue_type=issue_type, state="open", candidates=[{
+                "rejected_import_id": str(rejected.id),
+                "file_sha256": result["sha256"], "line": error.get("line"),
+                "message": error.get("message"),
+            }],
+        ))
+    audit(db, user, "import.rejected", "ImportRejection", rejected.id,
+          {"sha256": rejected.file_sha256, "errors": len(errors)}, source_id)
+    return rejected
+
+
 @app.post("/api/v1/imports/preview")
 async def import_preview(
     source_id: UUID = Form(...), profile_id: UUID = Form(...),
@@ -430,10 +469,14 @@ async def import_commit(
     data = await read_file(file)
     result = inspect_or_error(data, file.filename or "", profile, source, kind, period)
     if result["errors"]:
-        raise HTTPException(422, {
-            "reason": "Atomic import rejected: invalid rows",
-            "errors": result["errors"],
-        })
+        with transaction(db):
+            locked_period(db, period_id)
+            rejected = retain_rejected_import(
+                db, source_id, period_id, profile_id, user, data, result,
+                result["errors"])
+            return JSONResponse(status_code=422, content=error_body(
+                422, "Atomic import rejected: invalid rows", result["errors"]),
+                headers={"X-Rejection-ID": str(rejected.id)})
     with transaction(db):
         previous = db.scalar(select(ImportBatch).where(
             ImportBatch.source_id == source_id, ImportBatch.file_sha256 == result["sha256"]))
@@ -443,11 +486,22 @@ async def import_commit(
         locked_period(db, period_id)
         keys = [r["natural_key"] for r in result["records"]]
         for offset in range(0, len(keys), 500):
-            existing = db.scalar(select(Record.id).where(
+            existing = db.scalar(select(Record).where(
                 Record.source_id == source_id, Record.kind == kind,
                 Record.natural_key.in_(keys[offset:offset + 500])).limit(1))
             if existing:
-                raise HTTPException(409, "Natural-key duplicate; no rows were imported")
+                conflict = next(row for row in result["records"]
+                                if row["natural_key"] == existing.natural_key)
+                error = {
+                    "line": conflict["row_number"], "type": "duplicate",
+                    "record_id": str(existing.id),
+                    "message": "Natural-key duplicate from an earlier import",
+                }
+                rejected = retain_rejected_import(
+                    db, source_id, period_id, profile_id, user, data, result, [error])
+                return JSONResponse(status_code=409, content=error_body(
+                    409, "Natural-key duplicate; no financial rows imported", [error]),
+                    headers={"X-Rejection-ID": str(rejected.id)})
         object_key = f"originals/{source_id}/{result['sha256']}"
         put_original(object_key, data)  # failure aborts before any financial DB write
         batch = ImportBatch(
@@ -574,10 +628,14 @@ def issues(
         ReconcileIssue.state == state)
     if issue_type:
         stmt = stmt.where(ReconcileIssue.issue_type == issue_type)
+    found = db.scalars(stmt.order_by(ReconcileIssue.created_at)
+                       .limit(limit).offset(offset)).all()
+    assignments = {a.issue_id: str(a.owner_id) for a in db.scalars(
+        select(IssueAssignment).where(IssueAssignment.issue_id.in_([i.id for i in found])))}
     return [{"id": str(i.id), "record_id": str(i.record_id) if i.record_id else None,
-             "issue_type": i.issue_type, "state": i.state, "candidates": i.candidates}
-            for i in db.scalars(stmt.order_by(ReconcileIssue.created_at)
-                                 .limit(limit).offset(offset))]
+             "issue_type": i.issue_type, "state": i.state, "candidates": i.candidates,
+             "owner_id": assignments.get(i.id)}
+            for i in found]
 
 
 class GroupBody(BaseModel):
@@ -767,3 +825,81 @@ def request_metrics(user=Depends(current_user)):
         "scope": "single API process", "percentile_window": 10000,
         "routes": metrics.snapshot(),
     }
+
+
+class AssignIssueBody(BaseModel):
+    owner_id: UUID
+
+
+@app.post("/api/v1/issues/{issue_id}/assign")
+def assign_issue(issue_id: UUID, body: AssignIssueBody,
+                 user=Depends(current_user), db=Depends(get_db)):
+    require_role(user, "operator", "controller")
+    with transaction(db):
+        issue = db.scalar(select(ReconcileIssue).where(
+            ReconcileIssue.id == issue_id).with_for_update())
+        if not issue:
+            raise HTTPException(404, "Issue not found")
+        ensure_source(db, user, issue.source_id)
+        locked_period(db, issue.period_id)
+        owner = db.get(User, body.owner_id)
+        if not owner or owner.role != "operator" or not owner.enabled:
+            raise HTTPException(400, "Issue owner must be an enabled operator")
+        ensure_source(db, owner, issue.source_id)
+        assignment = db.scalar(select(IssueAssignment).where(
+            IssueAssignment.issue_id == issue_id).with_for_update())
+        if assignment:
+            assignment.owner_id = owner.id
+            assignment.assigned_by = user.id
+        else:
+            assignment = IssueAssignment(
+                issue_id=issue_id, owner_id=owner.id, assigned_by=user.id)
+            db.add(assignment)
+        audit(db, user, "issue.assigned", "ReconcileIssue", issue.id,
+              {"owner_id": str(owner.id)}, issue.source_id)
+        return {"id": str(issue.id), "owner_id": str(owner.id)}
+
+
+class ResolveIssueBody(BaseModel):
+    reason: str = Field(min_length=10, max_length=4000)
+
+
+@app.post("/api/v1/issues/{issue_id}/resolve")
+def resolve_issue(issue_id: UUID, body: ResolveIssueBody,
+                  user=Depends(current_user), db=Depends(get_db)):
+    require_role(user, "operator", "controller")
+    with transaction(db):
+        issue = db.scalar(select(ReconcileIssue).where(
+            ReconcileIssue.id == issue_id).with_for_update())
+        if not issue:
+            raise HTTPException(404, "Issue not found")
+        ensure_source(db, user, issue.source_id)
+        locked_period(db, issue.period_id)
+        if issue.state != "open":
+            raise HTTPException(409, "Issue already resolved")
+        issue.state = "resolved"
+        audit(db, user, "issue.resolved", "ReconcileIssue", issue.id,
+              {"reason": body.reason}, issue.source_id)
+        return {"id": str(issue.id), "state": issue.state}
+
+
+@app.get("/api/v1/imports/rejections/{rejection_id}/file")
+def get_rejected_original(rejection_id: UUID, user=Depends(current_user),
+                          db=Depends(get_db)):
+    item = db.get(ImportRejection, rejection_id)
+    if not item:
+        raise HTTPException(404, "Rejected import not found")
+    try:
+        ensure_source(db, user, item.source_id)
+        require_role(user, "operator", "controller", "admin", "auditor")
+    except HTTPException:
+        with SessionLocal.begin() as session:
+            audit(session, user, "security.file_denied", "ImportRejection", item.id,
+                  {"reason": "access_denied"}, item.source_id)
+        raise
+    data = get_original(item.object_key)
+    if hashlib.sha256(data).hexdigest() != item.file_sha256:
+        raise HTTPException(500, "Rejected original checksum mismatch")
+    return Response(data, media_type="application/octet-stream",
+                    headers={"Cache-Control": "no-store",
+                             "Content-Disposition": "attachment; filename=rejected.bin"})
