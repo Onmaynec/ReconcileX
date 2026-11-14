@@ -1,5 +1,7 @@
 """v0.2 security regressions; fixture data never contains real customer records."""
+import io
 import uuid
+import zipfile
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -68,3 +70,36 @@ def test_unknown_host_rejected_when_enabled(monkeypatch):
         "example.com", "api.example.com"]
     with pytest.raises(ValueError):
         valid_trusted_hosts("example.com, *")
+
+
+def test_malformed_zip_and_oversized_archive_return_422():
+    from app.importer import inspect_file
+    from types import SimpleNamespace
+    from datetime import date
+    profile = SimpleNamespace(
+        encoding="utf-8", delimiter=",", date_format="%Y-%m-%d",
+        decimal_separator=".", mapping={"reference": "reference",
+                                        "date": "date", "amount": "amount"})
+    source = SimpleNamespace(currency="RUB", account="TEST")
+    with pytest.raises(zipfile.BadZipFile):
+        inspect_file(b"this-is-not-xlsx", "bad.xlsx", profile, source,
+                     "external", date(2026, 8, 1), date(2026, 8, 31))
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        for index in range(201):
+            archive.writestr(f"file_{index}", "")
+    with pytest.raises(ValueError, match="Oversized XLSX"):
+        inspect_file(payload.getvalue(), "expanded.xlsx", profile, source,
+                     "external", date(2026, 8, 1), date(2026, 8, 31))
+
+
+def test_login_rate_limit_includes_retry_after():
+    import uuid
+    unknown = "brute-" + uuid.uuid4().hex
+    for _ in range(5):
+        assert client.post("/api/v1/auth/token",
+                           json={"username": unknown, "password": "invalid"}).status_code == 401
+    blocked = client.post("/api/v1/auth/token",
+                          json={"username": unknown, "password": "invalid"})
+    assert blocked.status_code == 429
+    assert blocked.headers["Retry-After"] == "60"

@@ -8,6 +8,8 @@ import os
 import time
 import re
 import uuid
+import zipfile
+from xml.etree.ElementTree import ParseError
 from datetime import date
 from datetime import datetime, timezone
 from typing import Literal
@@ -18,6 +20,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field, field_validator
+from openpyxl.utils.exceptions import InvalidFileException
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 
@@ -422,7 +425,8 @@ def inspect_or_error(data, filename, profile, source, kind, period):
     try:
         return inspect_file(data, filename, profile, source, kind,
                             period.start_date, period.end_date)
-    except (ValueError, UnicodeError, csv.Error, OSError, KeyError) as exc:
+    except (ValueError, UnicodeError, csv.Error, OSError, KeyError,
+            zipfile.BadZipFile, InvalidFileException, ParseError) as exc:
         raise HTTPException(422, f"Invalid input file: {exc}")
 
 
