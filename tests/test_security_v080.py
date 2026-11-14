@@ -118,3 +118,7 @@ def test_security_headers_are_present_on_public_health_response():
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert response.headers["Referrer-Policy"] == "no-referrer"
     assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_openapi_version_matches_release():
+    assert app.version == "0.8.0"
