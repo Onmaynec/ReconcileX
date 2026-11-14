@@ -13,8 +13,13 @@ depends_on = None
 
 
 def upgrade():
-    op.add_column("users", sa.Column(
-        "token_epoch", sa.Integer(), nullable=False, server_default="0"))
+    # Revision 0001 uses current ORM metadata when creating a fresh database.
+    # A fresh installation already gets this column there; an existing v0.3
+    # database must receive it here without a duplicate-column failure.
+    fields = {column["name"] for column in sa.inspect(op.get_bind()).get_columns("users")}
+    if "token_epoch" not in fields:
+        op.add_column("users", sa.Column(
+            "token_epoch", sa.Integer(), nullable=False, server_default="0"))
 
 
 def downgrade():
