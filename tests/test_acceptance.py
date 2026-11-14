@@ -846,3 +846,194 @@ def test_tolerant_indexed_rule_high_risk_still_requires_controller(setup):
                       headers=headers(tokens, role="controller"),
                       json={"expected_version": 1})
     assert yes.status_code == 200 and yes.json()["state"] == "approved"
+
+
+
+def test_v070_multiple_priorities_bulk_are_indexed_and_financially_exact(setup):
+    """Three rule levels, 621 pairs and no SQL lookup for each individual row."""
+    from collections import Counter
+    from sqlalchemy import event
+    from app.db import engine
+    from app.models import MatchGroup, ReconcileIssue
+
+    ids, tokens = setup
+    for name, priority, tolerance, require_ref in (
+        ("tolerant-fallback", 90, 5, True),
+        ("broad-fallback", 80, 0, False),
+    ):
+        response = client.post("/api/v1/rules",
+                               headers=headers(tokens, "admin"), json={
+            "source_id": str(ids["source"]), "rule_key": name,
+            "priority": priority, "day_window": 2,
+            "tolerance_minor": tolerance, "require_reference": require_ref,
+        })
+        assert response.status_code == 201, response.text
+
+    rows_external, rows_internal = [], []
+    for i in range(620):
+        day = f"2026-09-{(i % 28) + 1:02d}"
+        ref = f"MULTI-{i:05d}"
+        rows_external.append((ref, day, "10.00"))
+        rows_internal.append((ref, day, "10.00" if i < 500 else "9.97"))
+    rows_external.append(("BROAD-EXTERNAL", "2026-09-20", "88.21"))
+    rows_internal.append(("BROAD-INTERNAL", "2026-09-20", "88.21"))
+    assert import_rows(ids, tokens, "external", fixture_lines(*rows_external)).status_code == 200
+    assert import_rows(ids, tokens, "internal", fixture_lines(*rows_internal)).status_code == 200
+
+    submitted = client.post(
+        "/api/v1/reconciliation/run",
+        headers=headers(tokens, key="multi-bulk-priority-0070001"),
+        params={"period_id": str(ids["period"])},
+    )
+    assert submitted.status_code == 202, submitted.text
+    record_queries = []
+
+    def count_record_queries(conn, cursor, statement, params, context, executemany):
+        if statement.lstrip().lower().startswith("select") and "records" in statement.lower():
+            record_queries.append(statement)
+
+    event.listen(engine, "before_cursor_execute", count_record_queries)
+    try:
+        assert run_once()
+    finally:
+        event.remove(engine, "before_cursor_execute", count_record_queries)
+    assert len(record_queries) <= 8, len(record_queries)
+
+    with SessionLocal() as db:
+        groups = db.scalars(select(MatchGroup).where(
+            MatchGroup.period_id == ids["period"],
+            MatchGroup.source_id == ids["source"])).all()
+        assert len(groups) == 621
+        assert Counter(g.explanation["rule_key"] for g in groups) == {
+            "exact": 500, "tolerant-fallback": 120, "broad-fallback": 1,
+        }
+        assert sum(group.delta_minor for group in groups) == 360
+        assert all(group.state == "approved" for group in groups)
+        assert db.scalar(select(func.count(MatchMember.id)).join(
+            MatchGroup, MatchMember.group_id == MatchGroup.id).where(
+                MatchGroup.period_id == ids["period"], MatchMember.active.is_(True),
+        )) == 1242
+        assert db.scalar(select(func.count(ReconcileIssue.id)).where(
+            ReconcileIssue.period_id == ids["period"])) == 0
+        audit_rows = db.scalars(select(AuditEvent).where(
+            AuditEvent.source_id == ids["source"],
+            AuditEvent.action == "match.confirmed")).all()
+        assert len(audit_rows) == 621
+        assert sum(event.details["delta_minor"] for event in audit_rows) == 360
+
+    repeat = client.post(
+        "/api/v1/reconciliation/run",
+        headers=headers(tokens, key="multi-bulk-priority-0070002"),
+        params={"period_id": str(ids["period"])},
+    )
+    assert repeat.status_code == 202
+    assert run_once()
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count(MatchGroup.id)).where(
+            MatchGroup.period_id == ids["period"])) == 621
+
+
+def test_v070_same_priority_multiple_rules_one_candidate_is_not_ambiguous(setup):
+    from app.models import MatchGroup
+    ids, tokens = setup
+    response = client.post("/api/v1/rules",
+                           headers=headers(tokens, "admin"), json={
+        "source_id": str(ids["source"]), "rule_key": "z-broad",
+        "priority": 100, "day_window": 2, "tolerance_minor": 0,
+        "require_reference": False,
+    })
+    assert response.status_code == 201, response.text
+    assert import_rows(ids, tokens, "external", fixture_lines(
+        ("IDENTICAL", "2026-09-12", "18.01"))).status_code == 200
+    assert import_rows(ids, tokens, "internal", fixture_lines(
+        ("IDENTICAL", "2026-09-12", "18.01"))).status_code == 200
+    job = client.post("/api/v1/reconciliation/run",
+                      headers=headers(tokens, key="multi-same-one-00700001"),
+                      params={"period_id": str(ids["period"])})
+    assert job.status_code == 202
+    assert run_once()
+    with SessionLocal() as db:
+        group = db.scalar(select(MatchGroup).where(
+            MatchGroup.period_id == ids["period"]))
+        assert group is not None and group.state == "approved"
+        assert group.explanation["rule_key"] == "exact"
+        assert db.scalar(select(func.count(MatchGroup.id)).where(
+            MatchGroup.period_id == ids["period"])) == 1
+
+
+def test_v070_reverse_ambiguity_across_equal_priority_rules_blocks_match(setup):
+    from app.models import MatchGroup, ReconcileIssue
+    ids, tokens = setup
+    response = client.post("/api/v1/rules",
+                           headers=headers(tokens, "admin"), json={
+        "source_id": str(ids["source"]), "rule_key": "broad-same",
+        "priority": 100, "day_window": 2, "tolerance_minor": 0,
+        "require_reference": False,
+    })
+    assert response.status_code == 201, response.text
+    assert import_rows(ids, tokens, "external", fixture_lines(
+        ("TWO-EXTERNAL-A", "2026-09-12", "31.01"),
+        ("TWO-EXTERNAL-B", "2026-09-12", "31.01"))).status_code == 200
+    assert import_rows(ids, tokens, "internal", fixture_lines(
+        ("TWO-EXTERNAL-A", "2026-09-12", "31.01"))).status_code == 200
+    job = client.post("/api/v1/reconciliation/run",
+                      headers=headers(tokens, key="multi-reverse-00700001"),
+                      params={"period_id": str(ids["period"])})
+    assert job.status_code == 202
+    assert run_once()
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count(MatchGroup.id)).where(
+            MatchGroup.period_id == ids["period"])) == 0
+        issues = db.scalars(select(ReconcileIssue).where(
+            ReconcileIssue.period_id == ids["period"],
+            ReconcileIssue.issue_type == "ambiguous")).all()
+        assert len(issues) == 2
+        assert all(len(issue.candidates) == 2 for issue in issues)
+
+
+def test_v070_broad_rule_keeps_tolerance_date_and_high_risk_controls(setup):
+    from app.models import MatchGroup, ReconcileIssue
+    ids, tokens = setup
+    with SessionLocal.begin() as db:
+        db.get(MatchRule, ids["rule"]).current = False
+    response = client.post("/api/v1/rules",
+                           headers=headers(tokens, "admin"), json={
+        "source_id": str(ids["source"]), "rule_key": "broad-with-tolerance",
+        "priority": 70, "day_window": 1, "tolerance_minor": 5,
+        "require_reference": False,
+    })
+    assert response.status_code == 201, response.text
+    assert import_rows(ids, tokens, "external", fixture_lines(
+        ("BROAD-HIGH-A", "2026-09-12", "1500.00"),
+        ("BROAD-LATE-A", "2026-09-12", "44.00"),
+        ("BROAD-AMOUNT-A", "2026-09-14", "33.00"))).status_code == 200
+    assert import_rows(ids, tokens, "internal", fixture_lines(
+        ("BROAD-HIGH-B", "2026-09-12", "1499.98"),
+        ("BROAD-LATE-B", "2026-09-14", "44.00"),
+        ("BROAD-AMOUNT-B", "2026-09-14", "32.94"))).status_code == 200
+    job = client.post("/api/v1/reconciliation/run",
+                      headers=headers(tokens, key="multi-broad-risk-0070001"),
+                      params={"period_id": str(ids["period"])})
+    assert job.status_code == 202
+    assert run_once()
+    with SessionLocal() as db:
+        groups = db.scalars(select(MatchGroup).where(
+            MatchGroup.period_id == ids["period"])).all()
+        assert len(groups) == 1
+        group = groups[0]
+        assert group.state == "proposed" and group.delta_minor == 2
+        assert group.explanation["require_reference"] is False
+        assert group.explanation["tolerance_minor"] == 5
+        assert db.scalar(select(func.count(ReconcileIssue.id)).where(
+            ReconcileIssue.period_id == ids["period"],
+            ReconcileIssue.state == "open")) == 2
+        assert db.scalar(select(func.count(MatchMember.id)).where(
+            MatchMember.group_id == group.id,
+            MatchMember.active.is_(True))) == 0
+    rejected = client.post(f"/api/v1/match-groups/{group.id}/approve",
+                           headers=headers(tokens), json={"expected_version": 1})
+    assert rejected.status_code == 403
+    confirmed = client.post(f"/api/v1/match-groups/{group.id}/approve",
+                            headers=headers(tokens, "controller"),
+                            json={"expected_version": 1})
+    assert confirmed.status_code == 200
