@@ -306,106 +306,119 @@ def _batch_insert(db, model, values, size=500):
         db.execute(insert(model), values[offset:offset + size])
 
 
-def _indexed_candidates(index, record, window, forbidden,
-                        tolerance=0, maximum=11):
-    """Up to maximum candidates within date and amount limits.
+def _build_rule_indexes(rows, rules):
+    """Date or amount ordered candidate indexes, built once per source and side.
 
-    For exact matching date-sorted arrays reduce the search to the date
-    window. For nonzero tolerances amount-sorted arrays constrain the money
-    range first. Every candidate is then checked against the date window;
-    the reverse lookup prevents choosing an arbitrary 1:1 pair.
-    """
-    from bisect import bisect_left, bisect_right
-
-    if tolerance == 0:
-        key = (record.account, record.currency, record.reference,
-               record.amount_minor)
-        group = index.get(key)
-        if not group:
-            return []
-        dates, entries = group
-        lo = bisect_left(dates, record.booked_date - timedelta(days=window))
-        hi = bisect_right(dates, record.booked_date + timedelta(days=window))
-        result = []
-        for item in entries[lo:hi]:
-            if item.id not in forbidden:
-                result.append(item)
-                if len(result) >= maximum:
-                    break
-        return result
-
-    key = (record.account, record.currency, record.reference)
-    group = index.get(key)
-    if not group:
-        return []
-    amounts, entries = group
-    lo = bisect_left(amounts, record.amount_minor - tolerance)
-    hi = bisect_right(amounts, record.amount_minor + tolerance)
-    result = []
-    for item in entries[lo:hi]:
-        if (item.id not in forbidden and
-                abs((item.booked_date - record.booked_date).days) <= window):
-            result.append(item)
-            if len(result) >= maximum:
-                break
-    return result
-
-
-def _reconcile_indexed_reference(db, period, source_id, rule, submitter_id,
-                                 active, pending):
-    """Batch matching for a single reference-aware rule with any tolerance.
-
-    Date/amount indexed candidates avoid one SQL query per row; the reverse
-    check preserves symmetric uniqueness. Groups, members, issues and audit
-    are committed as one transaction, never as partial results.
+    Indexes are created only for the four lookup modes actually used by the
+    frozen rules. We keep compact SQL rows, not ORM Record objects or raw files.
     """
     from collections import defaultdict
+
+    modes = {(bool(rule["require_reference"]), rule["tolerance"] == 0)
+             for rule in rules}
+    groups = {mode: defaultdict(list) for mode in modes}
+    for row in rows:
+        for ref_required, exact in modes:
+            key = (row.account, row.currency)
+            if ref_required:
+                key += (row.reference,)
+            if exact:
+                key += (row.amount_minor,)
+            groups[ref_required, exact][key].append(row)
+
+    indexes = {}
+    for mode, buckets in groups.items():
+        exact = mode[1]
+        prepared = {}
+        for key, items in buckets.items():
+            if exact:
+                items.sort(key=lambda row: (row.booked_date, row.id))
+                prepared[key] = ([row.booked_date for row in items], items)
+            else:
+                items.sort(key=lambda row: (row.amount_minor, row.booked_date, row.id))
+                prepared[key] = ([row.amount_minor for row in items], items)
+        indexes[mode] = prepared
+    return indexes
+
+
+def _rule_candidates(indexes, record, rule, forbidden, maximum=11):
+    """Bounded 1:1 candidate search across exact/tolerant and ref/broad rules."""
+    from bisect import bisect_left, bisect_right
+
+    if maximum < 1:
+        return []
+    ref_required = bool(rule["require_reference"])
+    tolerance = int(rule["tolerance"])
+    exact = tolerance == 0
+    key = (record.account, record.currency)
+    if ref_required:
+        key += (record.reference,)
+    if exact:
+        key += (record.amount_minor,)
+    group = indexes.get((ref_required, exact), {}).get(key)
+    if not group:
+        return []
+    positions, items = group
+    if exact:
+        lo = bisect_left(
+            positions, record.booked_date - timedelta(days=rule["window"]))
+        hi = bisect_right(
+            positions, record.booked_date + timedelta(days=rule["window"]))
+    else:
+        lo = bisect_left(positions, record.amount_minor - tolerance)
+        hi = bisect_right(positions, record.amount_minor + tolerance)
+    found = []
+    for index in range(lo, hi):
+        other = items[index]
+        if other.id in forbidden:
+            continue
+        if not exact and abs((other.booked_date - record.booked_date).days) > rule["window"]:
+            continue
+        found.append(other)
+        if len(found) >= maximum:
+            break
+    return found
+
+
+def _reconcile_indexed_rules(db, period, source_id, rules, submitter_id,
+                             active, pending):
+    """Batch reconcile all priorities and rule types in one source transaction.
+
+    At the first priority with any candidates, all rules at that priority
+    contribute to ambiguity. A pair is accepted only if forward and reverse
+    lookups are both unique. No per-record SQL candidate queries are needed.
+    """
+    from itertools import groupby
     from sqlalchemy import update
 
     submitter = db.get(User, submitter_id)
     if submitter is None or not submitter.enabled:
         fail(409, "Reconciliation submitter no longer exists")
 
-    # Only the fields relevant for matching are materialized. Original data,
-    # normalized JSON and raw source text remain in PostgreSQL.
-    stmt = select(
+    rules = sorted(rules, key=lambda r: (-r["priority"], r["key"]))
+    priority_groups = [
+        list(group) for _, group in groupby(rules, lambda r: r["priority"])
+    ]
+    rows = db.execute(select(
         Record.id, Record.kind, Record.account, Record.currency,
         Record.reference, Record.amount_minor, Record.booked_date,
     ).where(
-        Record.period_id == period.id, Record.source_id == source_id,
-    ).order_by(Record.id)
-    rows = db.execute(stmt).all()
-    internals = defaultdict(list)
-    externals = defaultdict(list)
+        Record.period_id == period.id,
+        Record.source_id == source_id,
+    ).order_by(Record.id)).all()
+    external, internal = [], []
     any_internal = set()
-    external = []
-    tolerance = int(rule["tolerance"])
     for row in rows:
-        key = ((row.account, row.currency, row.reference, row.amount_minor)
-               if tolerance == 0
-               else (row.account, row.currency, row.reference))
         if row.kind == "internal":
+            internal.append(row)
             any_internal.add((row.reference, row.account))
-            internals[key].append(row)
         elif row.kind == "external":
             external.append(row)
-            externals[key].append(row)
     del rows
 
-    def build_index(buckets):
-        indexes = {}
-        for key, items in buckets.items():
-            if tolerance == 0:
-                items.sort(key=lambda row: (row.booked_date, row.id))
-                indexes[key] = ([item.booked_date for item in items], items)
-            else:
-                items.sort(key=lambda row: (row.amount_minor, row.booked_date, row.id))
-                indexes[key] = ([item.amount_minor for item in items], items)
-        return indexes
-
-    internal_index = build_index(internals)
-    external_index = build_index(externals)
-    del internals, externals
+    internal_index = _build_rule_indexes(internal, rules)
+    external_index = _build_rule_indexes(external, rules)
+    del internal
 
     existing_issues = set(db.execute(
         select(ReconcileIssue.record_id, ReconcileIssue.issue_type).where(
@@ -414,12 +427,8 @@ def _reconcile_indexed_reference(db, period, source_id, rule, submitter_id,
         )
     ).all())
     new_issues = {}
-    groups = []
-    members = []
-    events = []
-    approved_ids = []
+    groups, members, events, approved_ids = [], [], [], []
     threshold = int(os.getenv("RISK_THRESHOLD_MINOR", "10000000"))
-    rule_id = UUID(rule["id"])
     now = utcnow()
     stats = {"matched": 0, "proposed": 0, "ambiguous": 0, "unmatched": 0}
 
@@ -434,110 +443,137 @@ def _reconcile_indexed_reference(db, period, source_id, rule, submitter_id,
             return
         _batch_insert(db, MatchGroup, groups)
         _batch_insert(db, MatchMember, members)
-        if approved_ids:
-            for offset in range(0, len(approved_ids), 500):
-                db.execute(
-                    update(ReconcileIssue).where(
-                        ReconcileIssue.record_id.in_(
-                            approved_ids[offset:offset + 500]),
-                        ReconcileIssue.state == "open",
-                    ).values(state="resolved")
-                )
+        for offset in range(0, len(approved_ids), 500):
+            db.execute(update(ReconcileIssue).where(
+                ReconcileIssue.period_id == period.id,
+                ReconcileIssue.source_id == source_id,
+                ReconcileIssue.record_id.in_(approved_ids[offset:offset + 500]),
+                ReconcileIssue.state == "open",
+            ).values(state="resolved"))
         _batch_insert(db, AuditEvent, events)
         groups.clear()
         members.clear()
         events.clear()
         approved_ids.clear()
 
-    def record_issue(record_id, category, candidates):
-        key = (record_id, category)
+    def record_issue(record_id, issue_type, candidates):
+        key = (record_id, issue_type)
         if key in existing_issues or key in new_issues:
             return
         new_issues[key] = {
-            "id": uuid.uuid4(),
-            "period_id": period.id,
-            "source_id": source_id,
-            "record_id": record_id,
-            "issue_type": category,
+            "id": uuid.uuid4(), "period_id": period.id, "source_id": source_id,
+            "record_id": record_id, "issue_type": issue_type,
             "candidates": [str(item) for item in candidates[:10]],
             "state": "open",
         }
         if len(new_issues) >= 500:
             flush_issues()
 
+    def collect(indexes, row, priority_rules, forbidden):
+        """Deduplicate candidate records across equal-priority rules."""
+        found = {}
+        for rule in priority_rules:
+            for candidate in _rule_candidates(
+                    indexes, row, rule, forbidden, maximum=11):
+                found.setdefault(candidate.id, (candidate, rule))
+                if len(found) >= 11:
+                    break
+            if len(found) >= 11:
+                break
+        return found
+
     forbidden = active | pending
     for ext in external:
         if ext.id in forbidden:
             continue
-        found = _indexed_candidates(internal_index, ext, rule["window"],
-                                    forbidden, tolerance)
-        if len(found) > 1:
-            record_issue(ext.id, "ambiguous", [item.id for item in found])
-            stats["ambiguous"] += 1
+        selected = None
+        ambiguous = False
+        for priority_rules in priority_groups:
+            candidates = collect(internal_index, ext, priority_rules, forbidden)
+            if not candidates:
+                continue
+            if len(candidates) > 1:
+                record_issue(ext.id, "ambiguous", list(candidates))
+                stats["ambiguous"] += 1
+                ambiguous = True
+                break
+            internal_row, rule = next(iter(candidates.values()))
+
+            reverse = collect(external_index, internal_row, priority_rules, forbidden)
+            if len(reverse) > 1:
+                # Reverse candidates are intentionally capped. The current
+                # external record might fall beyond that cap: it still needs
+                # its own ambiguity issue rather than disappearing silently.
+                reverse_ids = list(reverse)
+                detail_ids = reverse_ids if ext.id in reverse else [ext.id] + reverse_ids
+                record_issue(ext.id, "ambiguous", detail_ids)
+                for candidate in reverse.values():
+                    record_issue(candidate[0].id, "ambiguous", reverse_ids)
+                stats["ambiguous"] += 1
+                ambiguous = True
+                break
+            if len(reverse) != 1 or ext.id not in reverse:
+                raise RuntimeError("Multi-rule matcher detected asymmetric candidate set")
+            selected = (internal_row, rule)
+            break
+
+        if ambiguous:
             continue
-        if not found:
+        if selected is None:
             record_issue(
                 ext.id,
-                "amount_mismatch" if (ext.reference, ext.account) in any_internal else "unmatched",
-                [],
+                "amount_mismatch" if (ext.reference, ext.account) in any_internal
+                else "unmatched", [],
             )
             stats["unmatched"] += 1
             continue
-        internal = found[0]
-        reverse = _indexed_candidates(external_index, internal, rule["window"],
-                                      forbidden, tolerance)
-        if len(reverse) > 1:
-            candidates = [item.id for item in reverse]
-            for candidate in reverse:
-                record_issue(candidate.id, "ambiguous", candidates)
-            stats["ambiguous"] += 1
-            continue
-        # Without symmetric uniqueness, a one-to-one choice is not safe.
-        if len(reverse) != 1 or reverse[0].id != ext.id:
-            raise RuntimeError("Exact matcher detected asymmetric candidate set")
-        if internal.account != ext.account or internal.currency != ext.currency:
-            raise RuntimeError("Cross-account/currency match rejected")
-        if abs((internal.booked_date - ext.booked_date).days) > rule["window"]:
-            raise RuntimeError("Matched dates exceed rule window")
-        delta = ext.amount_minor - internal.amount_minor
-        if abs(delta) > tolerance:
-            raise RuntimeError("Indexed matcher detected out-of-tolerance amounts")
 
-        high_risk = max(abs(ext.amount_minor), abs(internal.amount_minor)) > threshold
-        group_id = __import__("uuid").uuid4()
+        internal_row, rule = selected
+        if ext.account != internal_row.account or ext.currency != internal_row.currency:
+            raise RuntimeError("Cross-account/currency match rejected")
+        if rule["require_reference"] and ext.reference != internal_row.reference:
+            raise RuntimeError("Reference-aware match rejected")
+        if abs((ext.booked_date - internal_row.booked_date).days) > rule["window"]:
+            raise RuntimeError("Matched dates exceed rule window")
+        delta = ext.amount_minor - internal_row.amount_minor
+        if abs(delta) > rule["tolerance"]:
+            raise RuntimeError("Matched amount exceeds rule tolerance")
+
+        high_risk = max(abs(ext.amount_minor), abs(internal_row.amount_minor)) > threshold
+        group_id = uuid.uuid4()
         explanation = {
             "rule_key": rule["key"], "rule_version": rule["version"],
-            "priority": rule["priority"], "tolerance_minor": tolerance,
-            "day_window": rule["window"], "require_reference": True,
+            "priority": rule["priority"], "tolerance_minor": rule["tolerance"],
+            "day_window": rule["window"],
+            "require_reference": rule["require_reference"],
             "external_record_ids": [str(ext.id)],
-            "internal_record_ids": [str(internal.id)],
+            "internal_record_ids": [str(internal_row.id)],
             "features": {
                 "account": ext.account, "currency": ext.currency,
-                "references": [ext.reference],
+                "references": sorted({ext.reference, internal_row.reference}),
                 "date_range": [
-                    min(ext.booked_date, internal.booked_date).isoformat(),
-                    max(ext.booked_date, internal.booked_date).isoformat(),
+                    min(ext.booked_date, internal_row.booked_date).isoformat(),
+                    max(ext.booked_date, internal_row.booked_date).isoformat(),
                 ],
             },
         }
         groups.append({
             "id": group_id, "period_id": period.id, "source_id": source_id,
-            "rule_id": rule_id, "rule_version": rule["version"],
-            "state": "proposed" if high_risk else "approved",
-            "manual": False, "proposed_by": submitter_id,
+            "rule_id": UUID(rule["id"]), "rule_version": rule["version"],
+            "state": "proposed" if high_risk else "approved", "manual": False,
+            "proposed_by": submitter_id,
             "approved_by": None if high_risk else submitter_id,
             "approved_at": None if high_risk else now,
-            "version": 1 if high_risk else 2,
-            "explanation": explanation, "external_minor": ext.amount_minor,
-            "internal_minor": internal.amount_minor, "delta_minor": delta,
+            "version": 1 if high_risk else 2, "explanation": explanation,
+            "external_minor": ext.amount_minor, "internal_minor": internal_row.amount_minor,
+            "delta_minor": delta,
         })
         members.extend([
             {"group_id": group_id, "record_id": ext.id, "active": not high_risk},
-            {"group_id": group_id, "record_id": internal.id, "active": not high_risk},
+            {"group_id": group_id, "record_id": internal_row.id, "active": not high_risk},
         ])
         events.append({
-            "id": __import__("uuid").uuid4(), "source_id": source_id,
-            "actor_id": submitter_id,
+            "id": uuid.uuid4(), "source_id": source_id, "actor_id": submitter_id,
             "action": "match.proposed" if high_risk else "match.confirmed",
             "entity_type": "MatchGroup", "entity_id": str(group_id),
             "details": {
@@ -546,21 +582,21 @@ def _reconcile_indexed_reference(db, period, source_id, rule, submitter_id,
                 "high_risk": high_risk, "comment": None,
             },
         })
-        forbidden.update((ext.id, internal.id))
-        if not high_risk:
-            for record_id in (ext.id, internal.id):
+        forbidden.update((ext.id, internal_row.id))
+        if high_risk:
+            pending.update((ext.id, internal_row.id))
+            stats["proposed"] += 1
+        else:
+            active.update((ext.id, internal_row.id))
+            approved_ids.extend((ext.id, internal_row.id))
+            for record_id in (ext.id, internal_row.id):
                 for category in ("ambiguous", "unmatched", "amount_mismatch",
                                  "wrong_currency", "duplicate"):
                     staged = new_issues.get((record_id, category))
                     if staged is not None:
                         staged["state"] = "resolved"
-        if high_risk:
-            pending.update((ext.id, internal.id))
-            stats["proposed"] += 1
-        else:
-            active.update((ext.id, internal.id))
-            approved_ids.extend((ext.id, internal.id))
             stats["matched"] += 1
+
         if len(groups) >= 500:
             flush_issues()
             flush_groups()
@@ -571,10 +607,7 @@ def _reconcile_indexed_reference(db, period, source_id, rule, submitter_id,
 
 
 def reconcile(db, job):
-    """Idempotent rule matching: compare *all* candidates at the best matching priority."""
-    from itertools import groupby
-    from sqlalchemy import exists
-
+    """Idempotent indexed matching at the highest applicable rule priority."""
     period = locked_period(db, job.period_id)
     active = set(db.scalars(select(MatchMember.record_id).join(
         Record, Record.id == MatchMember.record_id).where(
@@ -582,122 +615,20 @@ def reconcile(db, job):
     pending = set(db.scalars(select(MatchMember.record_id).join(
         MatchGroup, MatchMember.group_id == MatchGroup.id).where(
             MatchGroup.state == "proposed",
-        MatchGroup.period_id == period.id)).all())
-    # SQL-level filtering avoids losing candidates behind a LIMIT when rows are already claimed.
-    claimed_query = select(MatchMember.id).where(
-        MatchMember.record_id == Record.id,
-        MatchMember.active.is_(True)).correlate(Record).exists()
-    pending_query = select(MatchMember.id).join(
-        MatchGroup, MatchMember.group_id == MatchGroup.id).where(
-            MatchMember.record_id == Record.id,
-            MatchGroup.state == "proposed").correlate(Record).exists()
+            MatchGroup.period_id == period.id)).all())
 
     rules_by_source = {}
     for rule in job.rules_snapshot:
         rules_by_source.setdefault(rule["source_id"], []).append(rule)
     stats = {"matched": 0, "proposed": 0, "ambiguous": 0, "unmatched": 0}
     for source_id, rules in rules_by_source.items():
-        src_uuid = UUID(source_id)
-        if len(rules) == 1 and rules[0]["require_reference"]:
-            result = _reconcile_indexed_reference(
-                db, period, src_uuid, rules[0], job.created_by, active, pending)
-            for metric, value in result.items():
-                stats[metric] += value
-            continue
-        rules.sort(key=lambda r: (-r["priority"], r["key"]))
-        priority_groups = [
-            list(group) for _, group in groupby(rules, key=lambda r: r["priority"])
-        ]
-        external = db.scalars(select(Record).where(
-            Record.period_id == period.id, Record.source_id == src_uuid,
-            Record.kind == "external").order_by(Record.id)).all()
-        for ext in external:
-            if ext.id in active or ext.id in pending:
-                continue
-            winner, ambiguous = None, False
-            for rules_at_priority in priority_groups:
-                candidates = {}
-                for rule in rules_at_priority:
-                    stmt = select(Record).where(
-                        Record.period_id == period.id,
-                        Record.source_id == src_uuid,
-                        Record.kind == "internal",
-                        Record.account == ext.account,
-                        Record.currency == ext.currency,
-                        Record.booked_date.between(
-                            ext.booked_date - timedelta(days=rule["window"]),
-                            ext.booked_date + timedelta(days=rule["window"])),
-                        Record.amount_minor.between(
-                            ext.amount_minor - rule["tolerance"],
-                            ext.amount_minor + rule["tolerance"]),
-                        ~claimed_query, ~pending_query,
-                    )
-                    if rule["require_reference"]:
-                        stmt = stmt.where(Record.reference == ext.reference)
-                    for item in db.scalars(stmt.limit(11)):
-                        candidates.setdefault(item.id, (item, rule))
-                if not candidates:
-                    continue
-                if len(candidates) != 1:
-                    _issue(db, ext, "ambiguous", [str(x) for x in candidates])
-                    stats["ambiguous"] += 1
-                    ambiguous = True
-                    break
-                internal, rule = next(iter(candidates.values()))
-
-                reverse = {}
-                for reverse_rule in rules_at_priority:
-                    reverse_stmt = select(Record).where(
-                        Record.period_id == period.id, Record.source_id == src_uuid,
-                        Record.kind == "external",
-                        Record.account == internal.account,
-                        Record.currency == internal.currency,
-                        Record.booked_date.between(
-                            internal.booked_date - timedelta(days=reverse_rule["window"]),
-                            internal.booked_date + timedelta(days=reverse_rule["window"])),
-                        Record.amount_minor.between(
-                            internal.amount_minor - reverse_rule["tolerance"],
-                            internal.amount_minor + reverse_rule["tolerance"]),
-                        ~claimed_query, ~pending_query,
-                    )
-                    if reverse_rule["require_reference"]:
-                        reverse_stmt = reverse_stmt.where(
-                            Record.reference == internal.reference)
-                    for possible in db.scalars(reverse_stmt.limit(11)):
-                        reverse[possible.id] = possible
-                if len(reverse) > 1:
-                    ids = [str(x) for x in reverse]
-                    for possible in reverse.values():
-                        _issue(db, possible, "ambiguous", ids)
-                    stats["ambiguous"] += 1
-                    ambiguous = True
-                    break
-                winner = (internal, rule)
-                break
-
-            if ambiguous:
-                continue
-            if winner is None:
-                other = db.scalar(select(Record.id).where(
-                    Record.period_id == period.id, Record.source_id == src_uuid,
-                    Record.kind == "internal", Record.reference == ext.reference,
-                    Record.account == ext.account).limit(1))
-                _issue(db, ext, "amount_mismatch" if other else "unmatched", [])
-                stats["unmatched"] += 1
-                continue
-            internal, rule = winner
-            submitter = db.get(User, job.created_by)
-            if not submitter:
-                fail(409, "Reconciliation submitter no longer exists")
-            group = _make_group(db, period, src_uuid, rule, [ext], [internal], actor=submitter)
-            if group.state == "approved":
-                active.update((ext.id, internal.id))
-                stats["matched"] += 1
-            else:
-                pending.update((ext.id, internal.id))
-                stats["proposed"] += 1
+        result = _reconcile_indexed_rules(
+            db, period, UUID(source_id), rules, job.created_by, active, pending)
+        for metric, value in result.items():
+            stats[metric] += value
     audit(db, None, "job.completed", "ReconcileJob", job.id, stats)
     return stats
+
 
 def build_report(db, period):
     rows = db.execute(select(
