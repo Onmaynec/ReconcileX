@@ -9,4 +9,6 @@ services:
     depends_on:
       api: {condition: service_started}
     restart: unless-stopped
-    networks: [backend]
+    networks:
+      backend:
+        ipv4_address: ${TLS_PROXY_IP:-172.29.240.10}

@@ -36,7 +36,7 @@ from app.request_context import request_id
 from app.observability import configure_logging, metrics
 from app.security import (
     current_user, ensure_source, hash_password, require_role,
-    token_for, verify_password, ROLES,
+    token_for, verify_password, ROLES, trusted_client_ip,
 )
 from app.service import (
     approve_group, audit, build_report, cancel_group, close_period,
@@ -76,7 +76,7 @@ def transaction(db):
 
 
 app = FastAPI(
-    title="ReconcileX API", version="0.4.0",
+    title="ReconcileX API", version="0.8.0",
     description="Auditable reconciliation for synthetic bank statements and internal ledgers.",
 )
 log = configure_logging()
@@ -196,8 +196,10 @@ class LoginBody(BaseModel):
 @app.post("/api/v1/auth/token")
 def login(body: LoginBody, request: Request, db=Depends(get_db)):
     """DB-backed 5 failures/60s limit for username + originating connection."""
+    # Behind TLS proxy, trust X-Real-IP only from the pinned proxy address.
+    # A caller-supplied forwarded header from any other peer is ignored.
     key = hashlib.sha256(
-        ((request.client.host if request.client else "unknown") + "|" + body.username.lower())
+        (trusted_client_ip(request) + "|" + body.username.lower())
         .encode("utf-8")).hexdigest()
     # PostgreSQL advisory lock makes first-attempt insert safe under concurrency.
     if db.bind.dialect.name == "postgresql":
