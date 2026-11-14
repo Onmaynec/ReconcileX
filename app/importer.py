@@ -113,7 +113,13 @@ def inspect_file(data, filename, profile, source, kind, start_date, end_date):
             total += amount
         except (ValueError, TypeError, KeyError) as exc:
             if len(errors) < 200:
-                errors.append({"line": index, "message": str(exc)})
+                message = str(exc)
+                issue_type = (
+                    "wrong_currency" if "Currency differs" in message else
+                    "duplicate" if "Duplicate natural key" in message else
+                    "validation_error"
+                )
+                errors.append({"line": index, "type": issue_type, "message": message})
     return {
         "sha256": digest(data), "valid_rows": len(output), "total_minor": total,
         "errors": errors, "records": output, "filename": Path(filename).name,
