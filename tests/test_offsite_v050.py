@@ -274,3 +274,52 @@ def test_offsite_failure_prevents_local_retention(isolated, monkeypatch):
         backup.backup_once(1)
     assert old.exists()
     assert len(backup.snapshots()) == 2
+
+
+def test_offsite_alert_contains_only_event_and_timestamp(isolated, monkeypatch):
+    _, _, _ = isolated
+    monkeypatch.setenv("OFFSITE_ALERT_WEBHOOK_URL", "https://monitor.example.invalid/events")
+    sent = []
+
+    class Success:
+        status = 202
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            return False
+
+    def receive(request, timeout):
+        assert timeout == 8
+        assert request.get_method() == "POST"
+        sent.append(json.loads(request.data.decode("utf-8")))
+        return Success()
+
+    monkeypatch.setattr(backup, "urlopen", receive)
+    backup.send_alert("backup_failed")
+    assert len(sent) == 1
+    assert set(sent[0]) == {"service", "event", "timestamp"}
+    assert sent[0]["service"] == "reconcilex"
+    assert sent[0]["event"] == "backup_failed"
+
+
+def test_alert_rejects_non_https_endpoints_without_calling_network(isolated, monkeypatch, capsys):
+    _, _, _ = isolated
+    monkeypatch.setenv("OFFSITE_ALERT_WEBHOOK_URL", "http://not-tls.example.invalid/hook")
+    monkeypatch.setattr(backup, "urlopen", lambda *args, **kwargs: pytest.fail(
+        "An insecure alert endpoint was called"))
+    backup.send_alert("backup_stale")
+    assert "invalid_https_endpoint" in capsys.readouterr().err
+
+
+def test_offsite_recovers_without_original_local_snapshot(isolated):
+    root, fake, conf = isolated
+    snapshot, manifest = sample_snapshot(root)
+    offsite.upload_snapshot(snapshot, manifest, client=fake, config=conf)
+    import shutil
+    shutil.rmtree(snapshot)
+    assert not backup.snapshots()
+    destination = root / "fresh-node"
+    recovered = offsite.download_snapshot(snapshot.name, destination,
+                                          client=fake, config=conf)
+    assert recovered["database"]["sha256"] == manifest["database"]["sha256"]
+    assert (destination / "objects" / manifest["objects"][0]["key"]).is_file()
