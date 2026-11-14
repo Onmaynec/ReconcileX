@@ -233,3 +233,31 @@ class AuthAttempt(Base):
     key = Column(String(64), primary_key=True)
     attempts = Column(Integer, nullable=False)
     window_start = Column(DateTime(timezone=True), nullable=False)
+
+
+class ImportRejection(Base):
+    """Rejected original file, retained for auditing without creating financial records."""
+    __tablename__ = "import_rejections"
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uid)
+    source_id = Column(Uuid(as_uuid=True), ForeignKey("data_sources.id"), nullable=False)
+    period_id = Column(Uuid(as_uuid=True), ForeignKey("periods.id"), nullable=False)
+    profile_id = Column(Uuid(as_uuid=True), ForeignKey("import_profiles.id"), nullable=False)
+    file_sha256 = Column(String(64), nullable=False)
+    object_key = Column(String(240), nullable=False)
+    filename = Column(String(240), nullable=False)
+    errors = Column(JSON, nullable=False)
+    created_by = Column(Uuid(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    __table_args__ = (
+        UniqueConstraint("source_id", "file_sha256", name="uq_rejected_file"),
+    )
+
+
+class IssueAssignment(Base):
+    """Current operator assignment; changes are captured by append-only audit events."""
+    __tablename__ = "issue_assignments"
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uid)
+    issue_id = Column(Uuid(as_uuid=True), ForeignKey("reconcile_issues.id"), nullable=False, unique=True)
+    owner_id = Column(Uuid(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    assigned_by = Column(Uuid(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
