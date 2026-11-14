@@ -299,6 +299,7 @@ def create_profile(body: ProfileBody, user=Depends(current_user), db=Depends(get
 
 @app.get("/api/v1/profiles")
 def list_profiles(source_id: UUID, user=Depends(current_user), db=Depends(get_db)):
+    require_role(user, "operator", "controller", "admin", "auditor")
     ensure_source(db, user, source_id)
     return [
         {"id": str(p.id), "name": p.name, "version": p.version, "encoding": p.encoding,
@@ -368,6 +369,7 @@ def add_rule(body: RuleBody, user=Depends(current_user), db=Depends(get_db)):
 
 @app.get("/api/v1/rules")
 def list_rules(source_id: UUID, user=Depends(current_user), db=Depends(get_db)):
+    require_role(user, "operator", "controller", "admin", "auditor")
     ensure_source(db, user, source_id)
     return [{
         "id": str(r.id), "rule_key": r.rule_key, "version": r.version,
@@ -562,6 +564,7 @@ def list_records(
     limit: int = 50, offset: int = 0,
     user=Depends(current_user), db=Depends(get_db),
 ):
+    require_role(user, "operator", "controller", "auditor")
     ensure_source(db, user, source_id)
     if limit < 1 or limit > 200 or offset < 0:
         raise HTTPException(400, "Invalid pagination")
@@ -620,6 +623,7 @@ def issues(
     source_id: UUID, period_id: UUID, issue_type: str | None = None, state: str = "open",
     limit: int = 50, offset: int = 0, user=Depends(current_user), db=Depends(get_db),
 ):
+    require_role(user, "operator", "controller", "auditor")
     ensure_source(db, user, source_id)
     if limit < 1 or limit > 200 or offset < 0:
         raise HTTPException(400, "Invalid pagination")
@@ -687,6 +691,7 @@ def get_match(group_id: UUID, user=Depends(current_user), db=Depends(get_db)):
     group = db.get(MatchGroup, group_id)
     if not group:
         raise HTTPException(404, "Group not found")
+    require_role(user, "operator", "controller", "auditor")
     ensure_source(db, user, group.source_id)
     member_ids = db.scalars(select(MatchMember.record_id).where(
         MatchMember.group_id == group_id)).all()
@@ -773,6 +778,7 @@ def period_report(period_id: UUID, user=Depends(current_user), db=Depends(get_db
 def export_records(
     source_id: UUID, period_id: UUID, user=Depends(current_user), db=Depends(get_db),
 ):
+    require_role(user, "operator", "controller", "auditor")
     ensure_source(db, user, source_id)
     records = db.scalars(select(Record).where(
         Record.source_id == source_id, Record.period_id == period_id
