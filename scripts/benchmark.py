@@ -9,7 +9,10 @@ import hashlib
 import json
 import os
 import platform
-import resource
+try:
+    import resource
+except ImportError:  # Windows: the parser protocol still works.
+    resource = None
 import statistics
 import sys
 import time
@@ -35,7 +38,11 @@ def percentile(values, percentage):
 
 def memory_mib():
     # ru_maxrss is KiB on Linux; record platform for interpretation.
-    return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 2)
+    if resource is None:
+        return None
+    # macOS reports bytes; Linux reports KiB.
+    maximum = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return round(maximum / (1024**2 if sys.platform == "darwin" else 1024), 2)
 
 
 def host_details():
