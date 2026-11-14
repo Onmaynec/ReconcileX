@@ -25,6 +25,7 @@ import boto3
 from botocore.config import Config
 
 from ops import offsite
+from reconcilex_config import secret_value
 
 KEY_PATTERN = re.compile(
     r"^(?:originals|rejected)/[0-9a-f-]{36}/[0-9a-f]{64}$")
@@ -39,6 +40,10 @@ def utcnow():
 def run(args, database=None):
     env = dict(os.environ)
     env["PGCONNECT_TIMEOUT"] = "15"
+    if not env.get("PGPASSWORD"):
+        password = secret_value("DB_PASSWORD")
+        if password:
+            env["PGPASSWORD"] = password
     if database:
         env["PGDATABASE"] = database
     process = subprocess.run(args, env=env, capture_output=True, text=True,
@@ -53,8 +58,8 @@ def run(args, database=None):
 def s3():
     return boto3.client(
         "s3", endpoint_url=os.environ["S3_ENDPOINT"],
-        aws_access_key_id=os.environ["S3_ACCESS_KEY"],
-        aws_secret_access_key=os.environ["S3_SECRET_KEY"],
+        aws_access_key_id=secret_value("S3_ACCESS_KEY", required=True),
+        aws_secret_access_key=secret_value("S3_SECRET_KEY", required=True),
         region_name="us-east-1",
         config=Config(signature_version="s3v4", retries={"max_attempts": 5}),
     )
