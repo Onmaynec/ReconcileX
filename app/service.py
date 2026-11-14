@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import uuid
 from datetime import timedelta, datetime, timezone
 from uuid import UUID
 
@@ -315,7 +316,7 @@ def _reconcile_indexed_exact(db, period, source_id, rule, submitter_id,
     rolls back the entire job. Ambiguous reverse matches are never guessed.
     """
     from collections import defaultdict
-    from sqlalchemy import insert, update
+    from sqlalchemy import update
 
     submitter = db.get(User, submitter_id)
     if submitter is None or not submitter.enabled:
@@ -371,12 +372,38 @@ def _reconcile_indexed_exact(db, period, source_id, rule, submitter_id,
     now = utcnow()
     stats = {"matched": 0, "proposed": 0, "ambiguous": 0, "unmatched": 0}
 
+    def flush_issues():
+        if new_issues:
+            _batch_insert(db, ReconcileIssue, list(new_issues.values()))
+            existing_issues.update(new_issues.keys())
+            new_issues.clear()
+
+    def flush_groups():
+        if not groups:
+            return
+        _batch_insert(db, MatchGroup, groups)
+        _batch_insert(db, MatchMember, members)
+        if approved_ids:
+            for offset in range(0, len(approved_ids), 500):
+                db.execute(
+                    update(ReconcileIssue).where(
+                        ReconcileIssue.record_id.in_(
+                            approved_ids[offset:offset + 500]),
+                        ReconcileIssue.state == "open",
+                    ).values(state="resolved")
+                )
+        _batch_insert(db, AuditEvent, events)
+        groups.clear()
+        members.clear()
+        events.clear()
+        approved_ids.clear()
+
     def record_issue(record_id, category, candidates):
         key = (record_id, category)
         if key in existing_issues or key in new_issues:
             return
         new_issues[key] = {
-            "id": __import__("uuid").uuid4(),
+            "id": uuid.uuid4(),
             "period_id": period.id,
             "source_id": source_id,
             "record_id": record_id,
@@ -384,6 +411,8 @@ def _reconcile_indexed_exact(db, period, source_id, rule, submitter_id,
             "candidates": [str(item) for item in candidates[:10]],
             "state": "open",
         }
+        if len(new_issues) >= 500:
+            flush_issues()
 
     forbidden = active | pending
     for ext in external:
@@ -464,6 +493,13 @@ def _reconcile_indexed_exact(db, period, source_id, rule, submitter_id,
             },
         })
         forbidden.update((ext.id, internal.id))
+        if not high_risk:
+            for record_id in (ext.id, internal.id):
+                for category in ("ambiguous", "unmatched", "amount_mismatch",
+                                 "wrong_currency", "duplicate"):
+                    staged = new_issues.get((record_id, category))
+                    if staged is not None:
+                        staged["state"] = "resolved"
         if high_risk:
             pending.update((ext.id, internal.id))
             stats["proposed"] += 1
@@ -471,20 +507,12 @@ def _reconcile_indexed_exact(db, period, source_id, rule, submitter_id,
             active.update((ext.id, internal.id))
             approved_ids.extend((ext.id, internal.id))
             stats["matched"] += 1
+        if len(groups) >= 500:
+            flush_issues()
+            flush_groups()
 
-    # Parent rows first, followed by membership, audit and issues.
-    _batch_insert(db, MatchGroup, groups)
-    _batch_insert(db, MatchMember, members)
-    if approved_ids:
-        for offset in range(0, len(approved_ids), 500):
-            db.execute(
-                update(ReconcileIssue).where(
-                    ReconcileIssue.record_id.in_(approved_ids[offset:offset + 500]),
-                    ReconcileIssue.state == "open",
-                ).values(state="resolved")
-            )
-    _batch_insert(db, AuditEvent, events)
-    _batch_insert(db, ReconcileIssue, list(new_issues.values()))
+    flush_issues()
+    flush_groups()
     return stats
 
 
