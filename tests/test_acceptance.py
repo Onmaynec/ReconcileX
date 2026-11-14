@@ -244,7 +244,7 @@ def test_at09_job_idempotence_and_restart(setup):
     ids, tokens = setup
     ex = fixture_lines(("ONE", "2026-09-20", "7.00"))
     assert import_rows(ids, tokens, "external", ex).status_code == 200
-    assert import_rows(ids, tokens, "internal", ex + "").status_code == 200
+    assert import_rows(ids, tokens, "internal", fixture_lines(("ONE", "2026-09-21", "7.00"))).status_code == 200
     res = client.post("/api/v1/reconciliation/run", params={"period_id": str(ids["period"])},
                       headers=headers(tokens, key="job-run-restart-0001"))
     assert res.status_code == 202, res.text
@@ -260,3 +260,34 @@ def test_at09_job_idempotence_and_restart(setup):
                                        records(ids, tokens, "external")]),
             MatchMember.active.is_(True)))
         assert count == 1
+
+
+def test_at06_parallel_confirmation_rejects_second_claim(setup):
+    ids, tokens = setup
+    assert import_rows(ids, tokens, "external", fixture_lines(
+        ("CONCURRENT", "2026-09-12", "2000.00"))).status_code == 200
+    assert import_rows(ids, tokens, "internal", fixture_lines(
+        ("CONCURRENT", "2026-09-12", "2000.00"),
+        ("CONCURRENT", "2026-09-13", "2000.00"))).status_code == 200
+    external = records(ids, tokens, "external")[0]
+    internal = records(ids, tokens, "internal")
+    groups = []
+    for idx, row in enumerate(internal):
+        response = client.post("/api/v1/match-groups", headers=headers(
+            tokens, key=f"parallel-approval-{idx:04}"), json={
+            "period_id": str(ids["period"]), "source_id": str(ids["source"]),
+            "rule_id": str(ids["rule"]), "external_ids": [external["id"]],
+            "internal_ids": [row["id"]], "comment": "Контроль конкурирующей сверки",
+        })
+        assert response.status_code == 201, response.text
+        assert response.json()["state"] == "proposed"
+        groups.append(response.json()["id"])
+
+    def approve(group_id):
+        return client.post(f"/api/v1/match-groups/{group_id}/approve",
+                           json={"expected_version": 1},
+                           headers=headers(tokens, "controller")).status_code
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        states = list(executor.map(approve, groups))
+    assert sorted(states) == [200, 409]
