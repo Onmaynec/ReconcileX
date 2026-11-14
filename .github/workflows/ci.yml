@@ -33,8 +33,8 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - run: pip install ruff==0.11.5
-      - run: ruff check app tests scripts --select E4,E7,E9,F821,F822,F823
-      - run: python -m compileall -q app migrations tests
+      - run: ruff check app tests scripts ops --select E4,E7,E9,F821,F822,F823
+      - run: python -m compileall -q app migrations tests ops
       - name: Test v0.3 to v0.4 schema upgrade
         run: |
           alembic upgrade 0003_exceptions
@@ -87,6 +87,19 @@ jobs:
           S3_ACCESS_KEY: reconcilex-local
           S3_SECRET_KEY: local-ci-object-secret-password
           JWT_SECRET: test-only-secret-with-32-or-more-characters-123456789
+
+      - name: Validate optional encrypted off-site deployment
+        run: docker compose -f compose.yaml -f compose.offsite.yaml config -q
+        env:
+          DB_PASSWORD: local-ci-database-password
+          S3_ACCESS_KEY: reconcilex-local
+          S3_SECRET_KEY: local-ci-object-secret-password
+          JWT_SECRET: test-only-secret-with-32-or-more-characters-123456789
+          OFFSITE_S3_ENDPOINT: https://offsite.example.invalid
+          OFFSITE_S3_BUCKET: reconcilex-test-remote
+          OFFSITE_S3_ACCESS_KEY: separate-test-key
+          OFFSITE_S3_SECRET_KEY: separate-test-secret
+          OFFSITE_MANIFEST_HMAC_KEY: test-only-signing-secret-with-32-characters
 
       - name: Build runtime image
         run: docker compose build api worker backup
