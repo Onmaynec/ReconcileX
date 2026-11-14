@@ -96,6 +96,7 @@ def mkdir_private(path):
 
 
 def backup_once(keep):
+    started = time.perf_counter()
     if keep < 1 or keep > 365:
         raise RuntimeError("BACKUP_KEEP must be between 1 and 365")
     BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -155,7 +156,8 @@ def backup_once(keep):
                 shutil.rmtree(outdated)
             print(json.dumps({"event": "backup_ok", "path": str(final),
                               "object_count": len(entries),
-                              "dump_sha256": manifest["database"]["sha256"]}), flush=True)
+                              "dump_sha256": manifest["database"]["sha256"],
+                              "duration_seconds": round(time.perf_counter()-started, 3)}), flush=True)
             return final
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
@@ -202,6 +204,7 @@ def query(sql, dbname):
 
 def restore_check(path):
     """Restore into a randomly named temporary DB, NEVER overwrite the live DB."""
+    started = time.perf_counter()
     manifest = validate_snapshot(path)
     temporary = "reconcilex_verify_" + uuid.uuid4().hex[:12]
     created = False
@@ -241,10 +244,30 @@ def restore_check(path):
                 raise RuntimeError("Restored closed-period snapshot checksum mismatch")
         print(json.dumps({"event": "restore_verified", "path": str(path),
                           "financial_batches": len(rows.splitlines()),
-                          "period_snapshots": len(snap_rows.splitlines())}), flush=True)
+                          "period_snapshots": len(snap_rows.splitlines()),
+                          "duration_seconds": round(time.perf_counter()-started, 3)}), flush=True)
     finally:
         if created:
             run(["dropdb", "--if-exists", "--force", temporary])
+
+
+def status(max_age_hours):
+    """Lightweight service health: a recent completed backup must exist."""
+    if max_age_hours <= 0:
+        raise RuntimeError("Maximum backup age must be positive")
+    found = snapshots()
+    if not found:
+        raise RuntimeError("No completed backup snapshot available")
+    latest = found[-1]
+    manifest_path(latest)
+    metadata = json.loads((latest / "manifest.json").read_text(encoding="utf-8"))
+    created = datetime.fromisoformat(metadata["created_utc"])
+    age_hours = (utcnow() - created).total_seconds() / 3600
+    if not 0 <= age_hours <= max_age_hours:
+        raise RuntimeError(f"Last successful backup is stale ({age_hours:.2f}h)")
+    print(json.dumps({"event": "backup_healthy",
+                      "age_hours": round(age_hours, 3),
+                      "last_snapshot": latest.name}), flush=True)
 
 
 def schedule():
@@ -268,15 +291,18 @@ def schedule():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("once", "verify", "restore-check", "schedule"))
+    parser.add_argument("command", choices=("once", "verify", "restore-check", "status", "schedule"))
     parser.add_argument("--snapshot", type=Path)
     parser.add_argument("--keep", type=int, default=int(os.getenv("BACKUP_KEEP", "7")))
+    parser.add_argument("--max-age-hours", type=float, default=36)
     args = parser.parse_args()
     try:
         if args.command == "once":
             backup_once(args.keep)
         elif args.command == "schedule":
             schedule()
+        elif args.command == "status":
+            status(args.max_age_hours)
         else:
             target = args.snapshot.resolve() if args.snapshot else (snapshots()[-1] if snapshots() else None)
             if target is None:
