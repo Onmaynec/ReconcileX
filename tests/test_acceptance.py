@@ -554,3 +554,44 @@ def test_period_close_rejects_incomplete_jobs(setup):
     accepted = client.post(f"/api/v1/periods/{ids['period']}/close",
                            headers=headers(tokens, "controller"))
     assert accepted.status_code == 200, accepted.text
+
+
+def test_role_access_limits_raw_rows_exports_and_issues(setup):
+    ids, tokens = setup
+    analyst = client.post("/api/v1/auth/token", json={
+        "username": "analyst", "password": os.environ["DEMO_PASSWORD"]})
+    assert analyst.status_code == 200, analyst.text
+    auth = {"Authorization": "Bearer " + analyst.json()["access_token"]}
+    data_params = {"source_id": str(ids["source"]), "period_id": str(ids["period"])}
+    assert client.get("/api/v1/records", params=data_params,
+                      headers=auth).status_code == 403
+    assert client.get("/api/v1/issues", params=data_params,
+                      headers=auth).status_code == 403
+    assert client.get("/api/v1/exports/records.csv", params=data_params,
+                      headers=auth).status_code == 403
+    assert client.get("/api/v1/reports/period/" + str(ids["period"]),
+                      headers=auth).status_code == 200
+
+
+def test_operator_cannot_read_ungranted_source(setup):
+    from app.models import SourceGrant
+    from app.security import token_for, hash_password
+
+    ids, tokens = setup
+    with SessionLocal.begin() as db:
+        limited = User(username="limited-" + uuid.uuid4().hex[:12],
+                       password_hash=hash_password("not-for-production-123"),
+                       role="operator")
+        db.add(limited)
+        db.flush()
+        db.add(SourceGrant(user_id=limited.id, source_id=ids["source"]))
+        limited_token = token_for(limited)
+    auth = {"Authorization": "Bearer " + limited_token}
+    result = client.get("/api/v1/records", params={
+        "source_id": str(ids["euro"]), "period_id": str(ids["period"])
+    }, headers=auth)
+    assert result.status_code == 403, result.text
+    valid = client.get("/api/v1/records", params={
+        "source_id": str(ids["source"]), "period_id": str(ids["period"])
+    }, headers=auth)
+    assert valid.status_code == 200, valid.text
