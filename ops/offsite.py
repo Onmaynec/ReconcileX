@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from reconcilex_config import secret_value
 
 SNAPSHOT_NAME = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{8}$")
 ORIGINAL_KEY = re.compile(r"^(?:originals|rejected)/[0-9a-f-]{36}/[0-9a-f]{64}$")
@@ -48,13 +49,12 @@ def configured():
 def settings():
     if not configured():
         raise RuntimeError("Off-site replication is disabled")
-    required = (
-        "OFFSITE_S3_ENDPOINT", "OFFSITE_S3_BUCKET",
-        "OFFSITE_S3_ACCESS_KEY", "OFFSITE_S3_SECRET_KEY",
-        "OFFSITE_MANIFEST_HMAC_KEY",
-    )
+    required = ("OFFSITE_S3_ENDPOINT", "OFFSITE_S3_BUCKET")
     if any(not os.getenv(key) for key in required):
-        raise RuntimeError("Off-site S3 endpoint, bucket and credentials are mandatory")
+        raise RuntimeError("Off-site S3 endpoint and bucket are mandatory")
+    access = secret_value("OFFSITE_S3_ACCESS_KEY", required=True)
+    secret = secret_value("OFFSITE_S3_SECRET_KEY", required=True)
+    manifest_key = secret_value("OFFSITE_MANIFEST_HMAC_KEY", required=True)
     endpoint = os.environ["OFFSITE_S3_ENDPOINT"].rstrip("/")
     parsed = urlparse(endpoint)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
@@ -66,9 +66,9 @@ def settings():
         source_endpoint and urlparse(source_endpoint).hostname == parsed.hostname
     ):
         raise RuntimeError("Off-site storage must use an independent endpoint")
-    access = os.environ["OFFSITE_S3_ACCESS_KEY"]
-    secret = os.environ["OFFSITE_S3_SECRET_KEY"]
-    if access == os.getenv("S3_ACCESS_KEY") or secret == os.getenv("S3_SECRET_KEY"):
+    source_access = secret_value("S3_ACCESS_KEY")
+    source_secret = secret_value("S3_SECRET_KEY")
+    if access == source_access or secret == source_secret:
         raise RuntimeError("Off-site storage must use separate credentials")
     prefix = os.getenv("OFFSITE_S3_PREFIX", "reconcilex").strip("/")
     if not PREFIX.fullmatch(prefix) or "//" in prefix or "/../" in f"/{prefix}/":
@@ -79,14 +79,14 @@ def settings():
     kms = os.getenv("OFFSITE_S3_KMS_KEY_ID") or None
     if encryption == "aws:kms" and not kms:
         raise RuntimeError("OFFSITE_S3_KMS_KEY_ID required for KMS encryption")
-    if len(os.environ["OFFSITE_MANIFEST_HMAC_KEY"]) < 32:
+    if len(manifest_key) < 32:
         raise RuntimeError("Off-site manifest HMAC key must have at least 32 characters")
     return Settings(
         endpoint=endpoint, bucket=os.environ["OFFSITE_S3_BUCKET"],
         access_key=access, secret_key=secret,
         region=os.getenv("OFFSITE_S3_REGION", "us-east-1"),
         prefix=prefix, encryption=encryption, kms_key=kms,
-        manifest_hmac_key=os.environ["OFFSITE_MANIFEST_HMAC_KEY"],
+        manifest_hmac_key=manifest_key,
     )
 
 
