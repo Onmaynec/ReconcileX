@@ -3,6 +3,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import zipfile
 from datetime import date, datetime
 from pathlib import Path
@@ -85,8 +86,17 @@ def create_xlsx(path, spec, number):
     book.save(temporary)
     try:
         with zipfile.ZipFile(temporary, "r") as source_zip:
-            members = [(info, source_zip.read(info.filename))
-                       for info in source_zip.infolist()]
+            members = []
+            for info in source_zip.infolist():
+                payload = source_zip.read(info.filename)
+                if info.filename == "docProps/core.xml":
+                    # openpyxl rewrites its modified property at save time.
+                    payload = re.sub(
+                        rb"(<dcterms:modified\b[^>]*>)[^<]*(</dcterms:modified>)",
+                        rb"\g<1>2026-01-01T00:00:00Z\g<2>",
+                        payload,
+                    )
+                members.append((info, payload))
         with zipfile.ZipFile(path, "w") as output_zip:
             for original, payload in members:
                 info = zipfile.ZipInfo(original.filename, date_time=(2026, 1, 1, 0, 0, 0))
