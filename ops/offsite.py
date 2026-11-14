@@ -5,6 +5,7 @@ the live database. Completed manifests are written only after every object
 has been uploaded and read back with a matching SHA-256.
 """
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -34,6 +35,7 @@ class Settings:
     prefix: str
     encryption: str
     kms_key: str | None
+    manifest_hmac_key: str
 
 
 def configured():
@@ -49,6 +51,7 @@ def settings():
     required = (
         "OFFSITE_S3_ENDPOINT", "OFFSITE_S3_BUCKET",
         "OFFSITE_S3_ACCESS_KEY", "OFFSITE_S3_SECRET_KEY",
+        "OFFSITE_MANIFEST_HMAC_KEY",
     )
     if any(not os.getenv(key) for key in required):
         raise RuntimeError("Off-site S3 endpoint, bucket and credentials are mandatory")
@@ -76,11 +79,14 @@ def settings():
     kms = os.getenv("OFFSITE_S3_KMS_KEY_ID") or None
     if encryption == "aws:kms" and not kms:
         raise RuntimeError("OFFSITE_S3_KMS_KEY_ID required for KMS encryption")
+    if len(os.environ["OFFSITE_MANIFEST_HMAC_KEY"]) < 32:
+        raise RuntimeError("Off-site manifest HMAC key must have at least 32 characters")
     return Settings(
         endpoint=endpoint, bucket=os.environ["OFFSITE_S3_BUCKET"],
         access_key=access, secret_key=secret,
         region=os.getenv("OFFSITE_S3_REGION", "us-east-1"),
         prefix=prefix, encryption=encryption, kms_key=kms,
+        manifest_hmac_key=os.environ["OFFSITE_MANIFEST_HMAC_KEY"],
     )
 
 
@@ -135,6 +141,11 @@ def validate_manifest(manifest):
                 or item["sha256"] != key.rsplit("/", 1)[-1]):
             raise RuntimeError("Invalid original object length or checksum")
     return manifest
+
+
+def manifest_signature(raw, config):
+    return hmac.new(config.manifest_hmac_key.encode("utf-8"),
+                    raw, hashlib.sha256).hexdigest()
 
 
 def object_descriptors(manifest):
@@ -218,6 +229,9 @@ def read_manifest(client, config, name):
         raise RuntimeError("Off-site manifest size mismatch")
     if hashlib.sha256(raw).hexdigest() != meta.get("Metadata", {}).get("sha256"):
         raise RuntimeError("Off-site manifest checksum mismatch")
+    if not hmac.compare_digest(
+        manifest_signature(raw, config), meta.get("Metadata", {}).get("hmac", "")):
+        raise RuntimeError("Off-site manifest authentication failed")
     try:
         return validate_manifest(json.loads(raw))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -283,7 +297,10 @@ def upload_snapshot(snapshot, manifest, client=None, config=None):
     try:
         client.put_object(
             Bucket=config.bucket, Key=commit_key, Body=raw,
-            IfNoneMatch="*", Metadata={"sha256": manifest_digest},
+            IfNoneMatch="*", Metadata={
+                "sha256": manifest_digest,
+                "hmac": manifest_signature(raw, config),
+            },
             **encryption_args(config),
         )
     except ClientError as exc:
