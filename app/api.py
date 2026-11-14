@@ -16,6 +16,7 @@ from uuid import UUID
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
@@ -40,6 +41,26 @@ from app.service import (
 )
 from app.storage import get_original, put_original
 
+def valid_trusted_hosts(raw):
+    """Parse explicit deployment hosts; '*' defeats Host-header validation."""
+    items = [item.strip() for item in raw.split(",")]
+    if not items or any(
+        not item or item == "*" or
+        not re.fullmatch(r"(?:\*\.)?[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*", item)
+        for item in items
+    ):
+        raise ValueError("TRUSTED_HOSTS must list valid, explicit hostnames")
+    return items
+
+
+def safe_csv_cell(value):
+    """Prevent spreadsheet formula evaluation, including leading whitespace."""
+    value = str(value)
+    if value.lstrip(" \t\r\n\f\v")[:1] in ("=", "+", "-", "@"):
+        return "'" + value
+    return value
+
+
 @contextmanager
 def transaction(db):
     try:
@@ -51,10 +72,15 @@ def transaction(db):
 
 
 app = FastAPI(
-    title="ReconcileX API", version="0.1.0",
+    title="ReconcileX API", version="0.2.0",
     description="Auditable reconciliation for synthetic bank statements and internal ledgers.",
 )
 log = configure_logging()
+if os.getenv("TRUSTED_HOSTS"):
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=valid_trusted_hosts(os.environ["TRUSTED_HOSTS"]),
+    )
 
 
 @app.middleware("http")
@@ -66,6 +92,9 @@ async def request_context_middleware(request: Request, call_next):
     try:
         response = await call_next(request)
         response.headers["X-Request-ID"] = identifier
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("Cache-Control", "no-store")
         elapsed = round((time.perf_counter() - started) * 1000, 3)
         route = request.scope.get("route")
         label = request.method + " " + (route.path if route else request.url.path)
@@ -93,7 +122,8 @@ async def http_error(request, exc):
     if isinstance(detail, dict):
         return JSONResponse(status_code=exc.status_code, content=error_body(
             exc.status_code, detail.get("reason", "Request rejected"), detail.get("errors", [])))
-    return JSONResponse(status_code=exc.status_code, content=error_body(exc.status_code, detail))
+    return JSONResponse(status_code=exc.status_code, content=error_body(exc.status_code, detail),
+                        headers=exc.headers or {})
 
 
 @app.exception_handler(RequestValidationError)
@@ -172,7 +202,8 @@ def login(body: LoginBody, request: Request, db=Depends(get_db)):
     attempt = db.scalar(select(AuthAttempt).where(AuthAttempt.key == key).with_for_update())
     now = datetime.now(timezone.utc)
     if attempt and (now - attempt.window_start).total_seconds() < 60 and attempt.attempts >= 5:
-        raise HTTPException(429, "Too many login attempts. Retry after 60 seconds")
+        raise HTTPException(429, "Too many login attempts. Retry after 60 seconds",
+                            headers={"Retry-After": "60"})
     user = db.scalar(select(User).where(User.username == body.username))
     if not user or not user.enabled or not verify_password(body.password, user.password_hash):
         if attempt is None:
@@ -483,6 +514,8 @@ async def import_commit(
         previous = db.scalar(select(ImportBatch).where(
             ImportBatch.source_id == source_id, ImportBatch.file_sha256 == result["sha256"]))
         if previous:
+            if previous.kind != kind or previous.period_id != period_id:
+                raise HTTPException(409, "Identical file was imported with a different kind or period")
             return {"id": str(previous.id), "duplicate": True,
                     "row_count": previous.row_count, "total_minor": previous.total_minor}
         locked_period(db, period_id)
@@ -786,12 +819,9 @@ def export_records(
     stream = io.StringIO()
     writer = csv.writer(stream)
     writer.writerow(["id", "kind", "reference", "date", "account", "currency", "amount_minor"])
-    def safe(value):
-        value = str(value)
-        return "'" + value if value[:1] in ("=", "+", "-", "@", "\t") else value
     for r in records:
-        writer.writerow([str(r.id), r.kind, safe(r.reference), r.booked_date.isoformat(),
-                         safe(r.account), r.currency, r.amount_minor])
+        writer.writerow([str(r.id), r.kind, safe_csv_cell(r.reference), r.booked_date.isoformat(),
+                         safe_csv_cell(r.account), r.currency, r.amount_minor])
     return Response(stream.getvalue(), media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition": "attachment; filename=records.csv"})
 
