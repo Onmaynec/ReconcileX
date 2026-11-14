@@ -98,11 +98,7 @@ jobs:
           done
           exit 1
       - run: docker compose config -q
-        env:
-          DB_PASSWORD: local-ci-database-password
-          S3_ACCESS_KEY: reconcilex-local
-          S3_SECRET_KEY: local-ci-object-secret-password
-          JWT_SECRET: test-only-secret-with-32-or-more-characters-123456789
+        env: {}
       - name: Validate optional TLS deployment override
         run: docker compose -f compose.yaml -f compose.tls.yaml config -q
         env:
@@ -110,6 +106,32 @@ jobs:
           S3_ACCESS_KEY: reconcilex-local
           S3_SECRET_KEY: local-ci-object-secret-password
           JWT_SECRET: test-only-secret-with-32-or-more-characters-123456789
+
+      - name: Prepare disposable file-backed deployment secrets
+        run: |
+          mkdir -p .ci-secrets
+          printf %s 'ci-db-password-only' > .ci-secrets/db_password
+          printf %s 'ci-jwt-secret-with-more-than-thirty-two-characters' > .ci-secrets/jwt_secret
+          printf %s 'ci-s3-access' > .ci-secrets/s3_access_key
+          printf %s 'ci-s3-secret-key-value' > .ci-secrets/s3_secret_key
+          printf %s 'ci-offsite-access' > .ci-secrets/offsite_access_key
+          printf %s 'ci-offsite-secret-key' > .ci-secrets/offsite_secret_key
+          printf %s 'ci-offsite-hmac-key-with-at-least-thirty-two-characters' > .ci-secrets/offsite_hmac_key
+          chmod 600 .ci-secrets/*
+          echo "DB_PASSWORD_FILE=$GITHUB_WORKSPACE/.ci-secrets/db_password" >> "$GITHUB_ENV"
+          echo "JWT_SECRET_FILE=$GITHUB_WORKSPACE/.ci-secrets/jwt_secret" >> "$GITHUB_ENV"
+          echo "S3_ACCESS_KEY_FILE=$GITHUB_WORKSPACE/.ci-secrets/s3_access_key" >> "$GITHUB_ENV"
+          echo "S3_SECRET_KEY_FILE=$GITHUB_WORKSPACE/.ci-secrets/s3_secret_key" >> "$GITHUB_ENV"
+          echo "OFFSITE_S3_ACCESS_KEY_FILE=$GITHUB_WORKSPACE/.ci-secrets/offsite_access_key" >> "$GITHUB_ENV"
+          echo "OFFSITE_S3_SECRET_KEY_FILE=$GITHUB_WORKSPACE/.ci-secrets/offsite_secret_key" >> "$GITHUB_ENV"
+          echo "OFFSITE_MANIFEST_HMAC_KEY_FILE=$GITHUB_WORKSPACE/.ci-secrets/offsite_hmac_key" >> "$GITHUB_ENV"
+      - name: Validate file-backed secret deployment profiles
+        run: |
+          docker compose -f compose.yaml -f compose.secrets.yaml config -q
+          docker compose -f compose.yaml -f compose.secrets.yaml -f compose.offsite.yaml -f compose.offsite.secrets.yaml config -q
+        env:
+          OFFSITE_S3_ENDPOINT: https://offsite.example.invalid
+          OFFSITE_S3_BUCKET: reconcilex-ci-remote
 
       - name: Validate optional encrypted off-site deployment
         run: docker compose -f compose.yaml -f compose.offsite.yaml config -q
@@ -125,29 +147,21 @@ jobs:
           OFFSITE_MANIFEST_HMAC_KEY: test-only-signing-secret-with-32-characters
 
       - name: Build runtime image
-        run: docker compose build api worker backup
-        env:
-          DB_PASSWORD: local-ci-database-password
-          S3_ACCESS_KEY: reconcilex-local
-          S3_SECRET_KEY: local-ci-object-secret-password
-          JWT_SECRET: test-only-secret-with-32-or-more-characters-123456789
+        run: docker compose -f compose.yaml -f compose.secrets.yaml build api worker backup
 
-      - name: Smoke test the complete Compose stack
+      - name: Smoke test the complete Compose stack with mounted secrets
         run: |
-          docker compose up -d --wait --wait-timeout 180
+          dc="docker compose -f compose.yaml -f compose.secrets.yaml"
+          $dc up -d --wait --wait-timeout 180
           curl --retry 20 --retry-all-errors --retry-delay 2 --max-time 5 --fail --silent --show-error http://127.0.0.1:8000/health/ready
-          docker compose run --rm api python -m app.seed
-          docker compose run --rm api python -m app.demo_import --rows 120
-          docker compose run --rm api python -m app.demo_import --rows 120
-          docker compose run --rm backup once
-          docker compose run --rm backup verify
-          docker compose run --rm backup restore-check
-          docker compose run --rm backup status --max-age-hours 36
+          $dc run --rm api python -m app.seed
+          $dc run --rm api python -m app.demo_import --rows 120
+          $dc run --rm api python -m app.demo_import --rows 120
+          $dc run --rm backup once
+          $dc run --rm backup verify
+          $dc run --rm backup restore-check
+          $dc run --rm backup status --max-age-hours 36
         env:
-          DB_PASSWORD: local-ci-database-password
-          S3_ACCESS_KEY: reconcilex-local
-          S3_SECRET_KEY: local-ci-object-secret-password
-          JWT_SECRET: test-only-secret-with-32-or-more-characters-123456789
           DEMO_PASSWORD: demo-test-password
       - name: TLS proxy smoke and per-client login throttling
         run: |
@@ -156,7 +170,7 @@ jobs:
           openssl req -x509 -nodes -newkey rsa:2048 -days 1 \
             -keyout certs/privkey.pem -out certs/fullchain.pem \
             -subj "/CN=localhost"
-          docker compose -f compose.yaml -f compose.tls.yaml up -d tls-proxy
+          docker compose -f compose.yaml -f compose.secrets.yaml -f compose.tls.yaml up -d tls-proxy
           curl --insecure --retry 20 --retry-all-errors --retry-delay 2 \
             --max-time 5 --fail --silent --show-error https://localhost/health/ready
           headers=$(curl --insecure -sS -D - -o /dev/null https://localhost/health/ready)
@@ -175,14 +189,10 @@ jobs:
           test "$last_status" = "429"
           rm -rf certs
         env:
-          DB_PASSWORD: local-ci-database-password
-          S3_ACCESS_KEY: reconcilex-local
-          S3_SECRET_KEY: local-ci-object-secret-password
-          JWT_SECRET: test-only-secret-with-32-or-more-characters-123456789
           TRUSTED_HOSTS: localhost,127.0.0.1
       - name: Collect Compose diagnostics
         if: failure()
-        run: docker compose -f compose.yaml -f compose.tls.yaml logs --no-color --tail=150
+        run: docker compose -f compose.yaml -f compose.secrets.yaml -f compose.tls.yaml logs --no-color --tail=150
         env:
           DB_PASSWORD: local-ci-database-password
           S3_ACCESS_KEY: reconcilex-local
@@ -190,7 +200,7 @@ jobs:
           JWT_SECRET: test-only-secret-with-32-or-more-characters-123456789
       - name: Tear down smoke stack
         if: always()
-        run: docker compose -f compose.yaml -f compose.tls.yaml down -v
+        run: docker compose -f compose.yaml -f compose.secrets.yaml -f compose.tls.yaml down -v
         env:
           DB_PASSWORD: local-ci-database-password
           S3_ACCESS_KEY: reconcilex-local
