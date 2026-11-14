@@ -35,7 +35,7 @@ jobs:
       - run: python -m compileall -q app migrations tests
       - run: alembic upgrade head
       - run: python -m app.seed
-      - run: pytest -q
+      - run: python -m pytest -q
       - run: python -c "from app.api import app; assert '/api/v1/imports/commit' in app.openapi()['paths']"
       - run: docker compose config -q
         env:
